@@ -143,12 +143,14 @@ def write_learned(table: dict[str, dict[str, Any]], path: str) -> dict[str, Any]
     """Merge ``table`` into the learned file at ``path`` (atomic tmp+rename).
 
     Merging (not replacing) keeps keys learned from an earlier, since-rotated
-    observation window instead of silently un-learning them — but only
-    ``provider/model`` keys. Bare-provider aggregates written by earlier
-    versions of this tool are exactly the unsound cross-model intervals the
-    module docstring rules out; left in place they would keep feeding
-    ``resolve_learned_ttl``'s provider fallback forever, so they are dropped
-    on every write.
+    observation window instead of silently un-learning them. Bare-provider
+    aggregates written by earlier versions of this tool are exactly the unsound
+    cross-model intervals the module docstring rules out; left in place they
+    would keep feeding ``resolve_learned_ttl``'s provider fallback forever, so
+    they are dropped on every write. They are identified by the estimator's own
+    metadata shape (``max_hit_idle``) — a bare-provider key WITHOUT that shape
+    is an operator-maintained fallback (``resolve_learned_ttl`` supports both a
+    plain number and a ``{"ttl_seconds": N}`` dict there) and is preserved.
     """
     merged: dict[str, Any] = {}
     try:
@@ -159,7 +161,11 @@ def write_learned(table: dict[str, dict[str, Any]], path: str) -> dict[str, Any]
     except (OSError, json.JSONDecodeError):
         pass
     merged.update(table)
-    merged = {k: v for k, v in merged.items() if "/" in k}
+    merged = {
+        k: v
+        for k, v in merged.items()
+        if "/" in k or not (isinstance(v, dict) and "max_hit_idle" in v)
+    }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:

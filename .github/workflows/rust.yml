@@ -54,6 +54,60 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Provide ONNX Runtime dylib
+        # headroom-core is built with `ort-load-dynamic` (see its
+        # Cargo.toml): the ONNX Runtime shared library is dlopen'd at
+        # runtime instead of statically linked, so the magika/detection
+        # tests need a real libonnxruntime.so and ORT_DYLIB_PATH pointing
+        # at it — same contract `headroom/_ort.py` fulfills for Python
+        # users via the pip `onnxruntime` package.
+        run: |
+          # >= 1.24, not 1.16: `ort`'s ORT_API_VERSION resolves to 24 because
+          # `fastembed` enables its `api-24` feature.
+          pip install 'onnxruntime>=1.24'
+          # Pre-flight, not just a pin. `ort` deadlocks rather than errors on
+          # ANY failure inside `load_dylib_from_path` — a version mismatch and
+          # a library that cannot be resolved at all both re-enter the `Once`
+          # that `setup_api()` is initialising, and `std::sync::Once` blocks
+          # forever on re-entry. Either way the job burns its full 30-minute
+          # timeout at 0% CPU with nothing in the log. Assert both conditions
+          # here so a bad runner fails in seconds with a readable message.
+          python - <<'PY' >> "$GITHUB_ENV"
+          import pathlib, sys
+
+          def die(msg: str) -> None:
+              print(f"::error::{msg}", file=sys.stderr)
+              raise SystemExit(1)
+
+          try:
+              import onnxruntime
+          except Exception as exc:  # noqa: BLE001 - any import failure is fatal here
+              die(f"onnxruntime is not importable: {exc}")
+
+          version = onnxruntime.__version__
+          try:
+              major, minor = (int(part) for part in version.split(".")[:2])
+          except ValueError:
+              die(f"cannot parse onnxruntime version {version!r}")
+          if (major, minor) < (1, 24):
+              die(
+                  f"onnxruntime {version} is too old: ort requires >= 1.24 "
+                  "(ORT_API_VERSION=24, set by fastembed's api-24 feature). "
+                  "ort DEADLOCKS instead of erroring below this, so the tests "
+                  "would hang rather than fail."
+              )
+
+          capi = pathlib.Path(onnxruntime.__file__).parent / "capi"
+          libs = sorted(capi.glob("libonnxruntime.so*")) or sorted(capi.glob("libonnxruntime*.dylib"))
+          if not libs:
+              die(f"no libonnxruntime shared library under {capi}")
+
+          print(f"ORT_DYLIB_PATH={libs[0]}")
+          print(f"onnxruntime {version} -> {libs[0]}", file=sys.stderr)
+          PY
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
@@ -101,7 +155,7 @@ jobs:
         # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"

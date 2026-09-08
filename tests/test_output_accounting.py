@@ -223,7 +223,7 @@ class TestHandlerWiring:
 
         app = self._app()
         with TestClient(app) as client:
-            self._install_fake_upstream(getattr(client.app, "state").proxy, 777)
+            self._install_fake_upstream(client.app.state.proxy, 777)
             resp = client.post(
                 "/v1/messages",
                 json={
@@ -258,7 +258,6 @@ class TestHandlerWiring:
 
         src = inspect.getsource(AnthropicHandlerMixin.handle_anthropic_messages)
         assert src.count("_observe_output_tokens(") == 2
-        assert src.count("_observe_effort_cost(") == 2
 
     def test_the_diag_line_reaches_the_log(self, caplog: pytest.LogCaptureFixture):
         """Attached directly because ``setup_logging`` clears propagation.

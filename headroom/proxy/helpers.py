@@ -1062,6 +1062,18 @@ def append_text_to_latest_user_input_item(
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
 
+# A *decompressed* body obeys the same ceiling as an uncompressed one. The
+# Content-Length gate at the handlers only ever saw the compressed wire size, so
+# a client could buy unlimited extra capacity with a compression ratio: ~2MB of
+# zeros expands to 2GB and the process dies allocating it (#3284). Same number,
+# deliberately: nobody should get more room by arriving gzipped.
+MAX_DECOMPRESSED_BODY_SIZE = MAX_REQUEST_BODY_SIZE
+
+# How much decompressed output to pull per step. The cap is re-checked after
+# every chunk, so the peak allocation is the limit plus one chunk — never the
+# full expansion of a bomb.
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
+
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
 
@@ -1272,8 +1284,54 @@ try:
 except ValueError:
     EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
 
-# Maximum compression cache sessions (prevents unbounded memory growth)
-MAX_COMPRESSION_CACHE_SESSIONS = 500
+# Maximum compression cache sessions (prevents unbounded memory growth).
+# Overridable via HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS for gateway
+# deployments (e.g. Kong sidecars) that fan many concurrent sessions into one
+# proxy process. Falls back to 500 on an unparseable value; floor of 1.
+try:
+    MAX_COMPRESSION_CACHE_SESSIONS = max(
+        1, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS", "500"))
+    )
+except ValueError:
+    MAX_COMPRESSION_CACHE_SESSIONS = 500
+
+# Idle TTL for per-session compression caches. Eviction is bust-free only
+# once the provider's own prompt cache has lapsed, so this must exceed the
+# LONGEST provider cache TTL Headroom serves — Anthropic's 1h extended
+# breakpoint (3600s), not just the common 5m ephemeral cache. Evicting
+# earlier would itself cause the bust this state exists to prevent: the
+# session returns, the provider still holds the old bytes, but the map that
+# replays them is gone. The cache must also outlive the prefix TRACKER's
+# session TTL (600s): after the tracker expires, `apply_cached`'s
+# byte-identical swap is the only thing still protecting the provider
+# prefix. Default 3900s = 1h + 5m grace. Deployments that never opt into
+# the 1h breakpoint can lower it via HEADROOM_COMPRESSION_CACHE_TTL_SECONDS.
+try:
+    # Floor of 600s: never below the prefix tracker's session TTL, or the
+    # sweep could reclaim the byte-identical swap map while it is the only
+    # remaining protection for a still-live provider prefix (see above).
+    # Non-finite floats ("nan"/"inf") parse but poison every idle comparison,
+    # so they are rejected like any other unparseable value.
+    _ttl_env = float(os.environ.get("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "3900"))
+    if _ttl_env != _ttl_env or _ttl_env in (float("inf"), float("-inf")):
+        raise ValueError("non-finite TTL")
+    COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
+except ValueError:
+    COMPRESSION_CACHE_TTL_SECONDS = 3900.0
+
+# Entries per session compression cache. 10k covers a single conversation with
+# ~2x headroom even at a 1M-token context (a compressible tool_result is at
+# least a few hundred tokens, so at most ~5k can be live at once). Raise via
+# HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES only for workloads that fan many
+# concurrent conversations into ONE session id (shared fallback ids, heavy
+# subagent fan-out) — entry LRU is hit-refreshed, so an undersized cap shows
+# up as misses on still-live entries, i.e. prefix-cache busts. Floor of 100.
+try:
+    COMPRESSION_CACHE_MAX_ENTRIES = max(
+        100, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "10000"))
+    )
+except ValueError:
+    COMPRESSION_CACHE_MAX_ENTRIES = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -2986,7 +3044,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 

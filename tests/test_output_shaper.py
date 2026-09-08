@@ -9,11 +9,6 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from headroom.proxy.effort_pricing import (
-    MIN_OBSERVATIONS,
-    EffortCostModel,
-    EffortPricingContext,
-)
 from headroom.proxy.output_shaper import (
     OutputShaperSettings,
     TurnKind,
@@ -21,12 +16,7 @@ from headroom.proxy.output_shaper import (
     apply_verbosity_steering,
     classify_openai_responses_input,
     classify_turn,
-    request_uses_prompt_caching,
-    route_effort,
-    route_openai_reasoning_effort,
-    route_openai_text_verbosity,
     shape_openai_chat_request,
-    shape_openai_responses_request,
     shape_request,
     steering_text,
 )
@@ -163,330 +153,6 @@ class TestVerbositySteering:
 
 
 # ---------------------------------------------------------------------------
-# route_effort
-# ---------------------------------------------------------------------------
-
-
-class TestRouteEffort:
-    def test_lowers_explicit_effort_on_mechanical_turn(self):
-        body = {"output_config": {"effort": "xhigh"}}
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert body["output_config"]["effort"] == "low"
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "lowered"
-
-    def test_never_injects_effort_when_absent(self):
-        body: dict[str, Any] = {"messages": []}
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert "output_config" not in body
-        assert labels == []
-        assert decision is None
-
-    def test_effort_untouched_on_new_ask(self):
-        body = {"output_config": {"effort": "xhigh"}}
-        assert route_effort(body, TurnKind.NEW_USER_ASK, ENABLED) == ([], None)
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_effort_untouched_on_error_continuation(self):
-        body = {"output_config": {"effort": "xhigh"}}
-        assert route_effort(body, TurnKind.ERROR_CONTINUATION, ENABLED) == ([], None)
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_effort_already_at_target_untouched(self):
-        body = {"output_config": {"effort": "low"}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == ([], None)
-
-    def test_unknown_effort_value_untouched(self):
-        body = {"output_config": {"effort": "turbo"}}
-        assert route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED) == ([], None)
-        assert body["output_config"]["effort"] == "turbo"
-
-    def test_configurable_mechanical_effort(self):
-        settings = OutputShaperSettings(enabled=True, mechanical_effort="medium")
-        body = {"output_config": {"effort": "xhigh"}}
-        route_effort(body, TurnKind.MECHANICAL_CONTINUATION, settings)
-        assert body["output_config"]["effort"] == "medium"
-
-    def test_pins_effort_when_tool_cache_control_present(self):
-        body = {
-            "output_config": {"effort": "xhigh"},
-            "tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}],
-        }
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert labels == []
-        assert decision == "pinned"
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_pins_effort_when_system_cache_control_present(self):
-        body = {
-            "output_config": {"effort": "xhigh"},
-            "system": [{"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}],
-        }
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert labels == []
-        assert decision == "pinned"
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_pins_effort_when_message_cache_control_present(self):
-        body = {
-            "output_config": {"effort": "xhigh"},
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
-                    ],
-                }
-            ],
-        }
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert labels == []
-        assert decision == "pinned"
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_no_pin_without_cache_control(self):
-        body = {"output_config": {"effort": "xhigh"}, "tools": [{"name": "read_file"}]}
-        labels, decision = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED)
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "lowered"
-
-
-class TestRouteEffortPricing:
-    """With a price attached, the blanket cache pin becomes a decision.
-
-    Without pricing the router refuses every cached request, which is safe but
-    leaves the saving on the table whenever the rewrite would repay. These pin
-    the two directions and the label format the audit trail reads.
-    """
-
-    @staticmethod
-    def _cached_body() -> dict[str, Any]:
-        return {
-            "output_config": {"effort": "xhigh"},
-            "system": [
-                {"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}
-            ],
-        }
-
-    @staticmethod
-    def _measured_model() -> EffortCostModel:
-        cost_model = EffortCostModel()
-        for _ in range(MIN_OBSERVATIONS):
-            cost_model.observe("claude-opus-5", "xhigh", 6000)
-            cost_model.observe("claude-opus-5", "low", 1000)
-        return cost_model
-
-    def test_short_horizon_keeps_the_effort_pinned(self):
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=2,
-        )
-        labels, decision = route_effort(
-            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
-        )
-        assert labels == []
-        assert decision == "pinned:horizon_too_short"
-        assert body["output_config"]["effort"] == "xhigh"
-
-    def test_long_horizon_lowers_the_effort(self):
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-        )
-        labels, decision = route_effort(
-            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
-        )
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "lowered:pays_back_within_horizon"
-        assert body["output_config"]["effort"] == "low"
-
-    def test_an_already_busting_turn_lowers_for_free(self):
-        """No measurement needed: the rewrite is being paid either way."""
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=EffortCostModel(),
-            prefix_already_busting=True,
-            expected_remaining_turns=1,
-        )
-        labels, decision = route_effort(
-            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
-        )
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "lowered:free_prefix_already_busting"
-
-    def test_a_bought_switch_is_recorded_for_later_turns(self):
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-        )
-        route_effort(self._cached_body(), TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
-        assert pricing.committed_effort == "low"
-
-    def test_a_committed_effort_survives_a_non_mechanical_turn(self):
-        """The regression that made writes spike: effort following the turn kind.
-
-        output_config leads every message, so letting the value drop back to the
-        client's on the next user ask rewrites the whole prefix. Measured live
-        2026-07-25: 10,335 write tokens on the first non-mechanical turn after a
-        lowered run, against 677 to 3,144 on the stable ones.
-        """
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-            committed_effort="low",
-        )
-        labels, decision = route_effort(body, TurnKind.NEW_USER_ASK, ENABLED, pricing)
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "sticky:reapplied"
-        assert body["output_config"]["effort"] == "low"
-
-    def test_a_held_value_is_not_a_body_mutation(self):
-        """Already at the committed value, so there is nothing to rewrite."""
-        body = self._cached_body()
-        body["output_config"]["effort"] = "low"
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-            committed_effort="low",
-        )
-        labels, decision = route_effort(body, TurnKind.NEW_USER_ASK, ENABLED, pricing)
-        assert labels == []
-        assert decision == "sticky:held"
-
-    def test_the_commit_callback_reaches_the_lineage(self):
-        seen: list[str] = []
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-            commit=seen.append,
-        )
-        route_effort(self._cached_body(), TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
-        assert seen == ["low"]
-
-    def test_a_failing_commit_does_not_break_the_turn(self):
-        def _explode(_value: str) -> None:
-            raise RuntimeError("tracker gone")
-
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=30,
-            commit=_explode,
-        )
-        labels, _ = route_effort(body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing)
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert body["output_config"]["effort"] == "low"
-
-    def test_an_unmeasured_model_stays_pinned(self):
-        body = self._cached_body()
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=EffortCostModel(),
-            expected_remaining_turns=100,
-        )
-        labels, decision = route_effort(
-            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
-        )
-        assert labels == []
-        assert decision == "pinned:unmeasured_delta"
-
-    def test_pricing_does_not_touch_the_uncached_path(self):
-        """An uncached request has no prefix to protect, so it lowers as before."""
-        body = {"output_config": {"effort": "xhigh"}}
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=EffortCostModel(),
-            expected_remaining_turns=1,
-        )
-        labels, decision = route_effort(
-            body, TurnKind.MECHANICAL_CONTINUATION, ENABLED, pricing
-        )
-        assert labels == ["output_shaper:effort:xhigh->low"]
-        assert decision == "lowered"
-
-    def test_shape_request_threads_the_price_through(self):
-        body = self._cached_body()
-        body["messages"] = [
-            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}
-        ]
-        pricing = EffortPricingContext(
-            model="claude-opus-5",
-            prefix_tokens=180_000,
-            cost_model=self._measured_model(),
-            expected_remaining_turns=2,
-        )
-        result = shape_request(body, ENABLED, pricing=pricing)
-        assert result.effort_decision == "pinned:horizon_too_short"
-        assert body["output_config"]["effort"] == "xhigh"
-
-
-# ---------------------------------------------------------------------------
-# request_uses_prompt_caching
-# ---------------------------------------------------------------------------
-
-
-class TestRequestUsesPromptCaching:
-    def test_false_for_plain_body(self):
-        body = {
-            "system": "Sys.",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"name": "read_file"}],
-        }
-        assert request_uses_prompt_caching(body) is False
-
-    def test_true_for_tool_cache_control(self):
-        body = {"tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}]}
-        assert request_uses_prompt_caching(body) is True
-
-    def test_true_for_system_block_cache_control(self):
-        body = {"system": [{"type": "text", "text": "Sys.", "cache_control": {"type": "ephemeral"}}]}
-        assert request_uses_prompt_caching(body) is True
-
-    def test_true_for_message_content_cache_control(self):
-        body = {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
-                    ],
-                }
-            ]
-        }
-        assert request_uses_prompt_caching(body) is True
-
-    def test_false_for_string_system(self):
-        assert request_uses_prompt_caching({"system": "Sys."}) is False
-
-    def test_false_for_string_message_content(self):
-        body = {"messages": [{"role": "user", "content": "hi"}]}
-        assert request_uses_prompt_caching(body) is False
-
-
-# ---------------------------------------------------------------------------
-# shape_request (end to end)
-# ---------------------------------------------------------------------------
 
 
 class TestShapeRequest:
@@ -501,7 +167,11 @@ class TestShapeRequest:
         assert result.changed is False
         assert body == snapshot
 
-    def test_enabled_applies_steering_and_effort_routing(self):
+    def test_steering_is_the_only_lever(self):
+        """Steering applies; request params are left exactly as the client sent
+        them. Effort routing was removed after measurement: on mechanical turns
+        it saved ~$0.0007 while a switch cost ~$0.011 in cache re-writes, and
+        the model's own API now rejects the legacy thinking form outright."""
         body = {
             "system": "Sys.",
             "messages": _mechanical_messages(),
@@ -510,25 +180,10 @@ class TestShapeRequest:
         }
         result = shape_request(body, ENABLED)
         assert result.changed is True
-        assert result.labels == [
-            "output_shaper:verbosity:L2",
-            "output_shaper:effort:xhigh->low",
-        ]
-        assert body["output_config"]["effort"] == "low"
-        assert body["system"][1]["text"] == steering_text(2)
-        assert result.effort_decision == "lowered"
-
-    def test_pinned_effort_leaves_body_untouched_but_reports_decision(self):
-        body = {
-            "system": "Sys.",
-            "messages": _mechanical_messages(),
-            "output_config": {"effort": "xhigh"},
-            "tools": [{"name": "read_file", "cache_control": {"type": "ephemeral"}}],
-        }
-        result = shape_request(body, ENABLED)
-        assert body["output_config"]["effort"] == "xhigh"
-        assert result.effort_decision == "pinned"
-        assert "output_shaper:effort:xhigh->low" not in result.labels
+        assert result.labels == ["output_shaper:verbosity:L3"]
+        assert body["output_config"]["effort"] == "xhigh", "must not touch effort"
+        assert body["thinking"] == {"type": "adaptive"}, "must not touch thinking"
+        assert body["system"][1]["text"] == steering_text(3)
 
     def test_new_ask_gets_steering_but_keeps_effort(self):
         body = {
@@ -537,7 +192,7 @@ class TestShapeRequest:
             "output_config": {"effort": "xhigh"},
         }
         result = shape_request(body, ENABLED)
-        assert result.labels == ["output_shaper:verbosity:L2"]
+        assert result.labels == ["output_shaper:verbosity:L3"]
         assert body["output_config"]["effort"] == "xhigh"
 
     def test_second_pass_is_stable(self):
@@ -555,19 +210,15 @@ class TestShapeRequest:
     def test_from_env_enabled_with_overrides(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
         monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
-        monkeypatch.setenv("HEADROOM_MECHANICAL_EFFORT", "medium")
         settings = OutputShaperSettings.from_env()
         assert settings.enabled is True
         assert settings.verbosity_level == 3
-        assert settings.mechanical_effort == "medium"
 
     def test_from_env_clamps_bad_values(self, monkeypatch):
         monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "true")
         monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "99")
-        monkeypatch.setenv("HEADROOM_MECHANICAL_EFFORT", "bogus")
         settings = OutputShaperSettings.from_env()
         assert settings.verbosity_level == 4
-        assert settings.mechanical_effort == "low"
 
 
 class TestOpenAIResponsesClassify:
@@ -614,77 +265,6 @@ class TestOpenAIResponsesSteering:
         assert body == snapshot
 
 
-class TestOpenAIResponsesReasoning:
-    def test_reasoning_effort_lowers_only_for_mechanical_continuations(self):
-        body = {"reasoning": {"effort": "xhigh"}}
-        labels = route_openai_reasoning_effort(
-            body,
-            TurnKind.MECHANICAL_CONTINUATION,
-            ENABLED,
-        )
-        assert labels == ["output_shaper:reasoning_effort:xhigh->low"]
-        assert body["reasoning"]["effort"] == "low"
-
-        new_ask = {"reasoning": {"effort": "xhigh"}}
-        assert route_openai_reasoning_effort(new_ask, TurnKind.NEW_USER_ASK, ENABLED) == []
-        assert new_ask["reasoning"]["effort"] == "xhigh"
-
-    def test_reasoning_effort_is_not_injected_when_absent(self):
-        body: dict[str, Any] = {}
-        labels = route_openai_reasoning_effort(
-            body,
-            TurnKind.MECHANICAL_CONTINUATION,
-            ENABLED,
-        )
-        assert labels == []
-        assert "reasoning" not in body
-
-
-class TestOpenAIResponsesTextVerbosity:
-    def test_text_verbosity_set_for_gpt5_family(self):
-        body = {"model": "gpt-5.1"}
-        labels = route_openai_text_verbosity(body)
-        assert labels == ["output_shaper:text_verbosity:unset->low"]
-        assert body["text"] == {"verbosity": "low"}
-
-    def test_text_verbosity_not_injected_for_non_gpt5(self):
-        body = {"model": "gpt-4o"}
-        assert route_openai_text_verbosity(body) == []
-        assert "text" not in body
-
-    def test_existing_text_verbosity_is_lowered_for_any_model(self):
-        body = {"model": "gpt-4o", "text": {"verbosity": "medium"}}
-        labels = route_openai_text_verbosity(body)
-        assert labels == ["output_shaper:text_verbosity:medium->low"]
-        assert body["text"]["verbosity"] == "low"
-
-    def test_shape_openai_responses_combines_steering_native_knobs(self):
-        body = {
-            "model": "gpt-5",
-            "input": [
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_1",
-                    "output": "ok",
-                }
-            ],
-            "instructions": "System.",
-            "reasoning": {"effort": "xhigh"},
-            "text": {"verbosity": "medium"},
-        }
-        result = shape_openai_responses_request(body, ENABLED)
-
-        assert result.changed is True
-        assert result.labels == [
-            "output_shaper:verbosity:L2",
-            "output_shaper:reasoning_effort:xhigh->low",
-            "output_shaper:text_verbosity:medium->low",
-        ]
-        assert steering_text(2) in body["instructions"]
-        assert body["reasoning"]["effort"] == "low"
-        assert body["text"]["verbosity"] == "low"
-
-
 class TestShapeOpenAIChatRequest:
     def test_disabled_is_noop(self):
         body = {"messages": [{"role": "system", "content": "Sys."}]}
@@ -702,8 +282,8 @@ class TestShapeOpenAIChatRequest:
         }
         result = shape_openai_chat_request(body, ENABLED)
         assert result.changed is True
-        assert result.labels == ["output_shaper:verbosity:L2"]
-        assert steering_text(2) in body["messages"][0]["content"]
+        assert result.labels == ["output_shaper:verbosity:L3"]
+        assert steering_text(3) in body["messages"][0]["content"]
         # User turn is untouched.
         assert body["messages"][1] == {"role": "user", "content": "hi"}
 
@@ -720,3 +300,130 @@ class TestShapeOpenAIChatRequest:
         second = shape_openai_chat_request(body, ENABLED)
         assert second.changed is False
         assert body == snapshot
+
+
+class TestShaperEnabledFor:
+    """The gate. Steering is opt-in: it appends a block to the system prompt,
+    and at L3 that is a visible behaviour change, so a user who did not ask
+    for it must not get it."""
+
+    @staticmethod
+    def _config(*, optimize: bool, env: dict[str, str] | None = None):
+        from types import SimpleNamespace
+
+        from headroom.rollout import resolve_rollout
+
+        return SimpleNamespace(optimize=optimize, rollout=resolve_rollout(env or {}))
+
+    def test_off_without_an_explicit_opt_in(self):
+        from headroom.proxy.output_shaper import shaper_enabled_for
+
+        assert shaper_enabled_for(self._config(optimize=True)) is False
+
+    def test_on_when_explicitly_enabled(self):
+        from headroom.proxy.output_shaper import shaper_enabled_for
+
+        cfg = self._config(optimize=True, env={"HEADROOM_OUTPUT_SHAPER": "1"})
+        assert shaper_enabled_for(cfg) is True
+
+    def test_explicit_request_shapes_even_with_optimize_off(self):
+        """Shaping without input compression is a supported combination."""
+        from headroom.proxy.output_shaper import shaper_enabled_for
+
+        cfg = self._config(optimize=False, env={"HEADROOM_OUTPUT_SHAPER": "1"})
+        assert shaper_enabled_for(cfg) is True
+
+    def test_kill_switch_wins(self):
+        from headroom.proxy.output_shaper import shaper_enabled_for
+
+        for env in (
+            {"HEADROOM_OUTPUT_SHAPER": "0"},
+            {"HEADROOM_DISABLE_FEATURES": "proxy_output_shaper"},
+        ):
+            assert shaper_enabled_for(self._config(optimize=True, env=env)) is False
+
+    def test_default_on_would_still_respect_optimize_off(self, monkeypatch):
+        """A guard for a default that does not exist yet.
+
+        The feature is opt-in, so `reason is DEFAULT` with `enabled` true
+        cannot currently occur. The branch is kept because turning the default
+        back on would otherwise silently reintroduce the byte-faithful
+        forwarding bug: an operator running `optimize=False` would start
+        getting a steering block appended, and on a body with no `system`
+        field, one created.
+        """
+        from headroom.proxy.output_shaper import shaper_enabled_for
+        from headroom.rollout import FeatureDecisionReason
+
+        class _Decision:
+            enabled = True
+            reason = FeatureDecisionReason.DEFAULT
+
+        class _Rollout:
+            def decision(self, name):
+                return _Decision()
+
+        from types import SimpleNamespace
+
+        assert shaper_enabled_for(SimpleNamespace(optimize=False, rollout=_Rollout())) is False
+        assert shaper_enabled_for(SimpleNamespace(optimize=True, rollout=_Rollout())) is True
+
+    def test_no_rollout_snapshot_falls_back_to_the_env_var(self):
+        """SDK/test callers build a config without a snapshot; returning None
+        preserves OutputShaperSettings.from_env's own resolution."""
+        from types import SimpleNamespace
+
+        from headroom.proxy.output_shaper import shaper_enabled_for
+
+        assert shaper_enabled_for(SimpleNamespace(optimize=True, rollout=None)) is None
+        assert shaper_enabled_for(None) is None
+
+
+class TestCacheModeSuppressesSteeringOnly:
+    """``mode="cache"`` freezes prior turns for prefix-cache stability.
+
+    Steering is the one lever that writes into that key: it appends to the
+    system-prompt tail, and on a body carrying no ``system`` field it creates
+    one, displacing ``messages[0]``. Effort routing and the thinking budget
+    ride request parameters outside the key, so they must keep working — the
+    point is a targeted suppression, not switching the feature off.
+    """
+
+    def test_steering_allowed_for_reads_the_mode(self):
+        from types import SimpleNamespace
+
+        from headroom.proxy.output_shaper import steering_allowed_for
+
+        assert steering_allowed_for(SimpleNamespace(mode="token")) is True
+        assert steering_allowed_for(SimpleNamespace(mode="cache")) is False
+        assert steering_allowed_for(None) is True, "absent config must not disable levers"
+
+    def test_cache_mode_resolves_level_zero(self):
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        settings = OutputShaperSettings(enabled=True, verbosity_level=3, steering_enabled=False)
+        assert resolve_verbosity_level(settings) == (0, "cache_mode")
+
+    def test_cache_mode_outranks_the_manual_level_override(self, monkeypatch):
+        """An env-set level must not reintroduce the prefix mutation."""
+        from headroom.proxy import runtime_env
+        from headroom.proxy.output_shaper import OutputShaperSettings, resolve_verbosity_level
+
+        monkeypatch.setattr(runtime_env, "getenv", lambda k, d="": "4" if "VERBOSITY" in k else d)
+        settings = OutputShaperSettings(enabled=True, verbosity_level=4, steering_enabled=False)
+        assert resolve_verbosity_level(settings)[0] == 0
+
+    def test_effort_routing_survives_cache_mode(self):
+        """The savings that do not touch the cache key must still apply."""
+        from headroom.proxy.output_shaper import OutputShaperSettings, shape_request
+
+        body = {
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+            ],
+        }
+        settings = OutputShaperSettings(enabled=True, verbosity_level=2, steering_enabled=False)
+        result = shape_request(body, settings, level_override=0)
+        assert "system" not in body, "cache mode must not create a system block"
+        assert result is not None

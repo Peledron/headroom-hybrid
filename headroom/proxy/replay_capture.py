@@ -20,14 +20,16 @@ import logging
 import os
 import re
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 logger = logging.getLogger("headroom.proxy")
 
 ENV_VAR = "HEADROOM_REPLAY_CAPTURE"
 DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024
 _REDACTED = "[redacted]"
+_SEQUENCE_RE = re.compile(r"replay-(\d+)\.jsonl$")
 _SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -118,9 +120,7 @@ class ReplayCapture:
                 headers=headers,
             )
         except Exception:
-            logger.debug(
-                "[%s] replay_capture: record failed, skipping", request_id, exc_info=True
-            )
+            logger.debug("[%s] replay_capture: record failed, skipping", request_id, exc_info=True)
 
     def _record(
         self,
@@ -153,16 +153,34 @@ class ReplayCapture:
                 fh.write(line)
 
     def _current_path_locked(self, incoming_bytes: int) -> Path:
-        """Pick the active file, rotating if it would cross the size cap."""
+        """Pick the active file, rotating if it would cross the size cap.
+
+        On first use the writer resumes at the highest sequence already in
+        the directory. Starting from zero on every restart walked one full
+        file per record, which left a stray out-of-order record in each
+        earlier file before the writer reached the open tail.
+        """
         if self._active_path is None:
+            self._sequence = self._resume_sequence_locked()
             self._active_path = self._directory / f"replay-{self._sequence:04d}.jsonl"
-        existing_size = 0
-        if self._active_path.exists():
-            existing_size = self._active_path.stat().st_size
-        if existing_size + incoming_bytes > self._max_file_bytes and existing_size > 0:
-            self._sequence += 1
-            self._active_path = self._directory / f"replay-{self._sequence:04d}.jsonl"
-        return self._active_path
+        while True:
+            existing_size = 0
+            if self._active_path.exists():
+                existing_size = self._active_path.stat().st_size
+            if existing_size + incoming_bytes > self._max_file_bytes and existing_size > 0:
+                self._sequence += 1
+                self._active_path = self._directory / f"replay-{self._sequence:04d}.jsonl"
+                continue
+            return self._active_path
+
+    def _resume_sequence_locked(self) -> int:
+        """Highest sequence number present in the directory, or zero."""
+        highest = 0
+        for path in self._directory.glob("replay-*.jsonl"):
+            match = _SEQUENCE_RE.match(path.name)
+            if match is not None:
+                highest = max(highest, int(match.group(1)))
+        return highest
 
 
 def iter_replay_records(source: Path | str) -> Iterator[dict[str, Any]]:

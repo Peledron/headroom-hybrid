@@ -1,5 +1,4 @@
 import json
-import os
 
 import pytest
 
@@ -107,8 +106,7 @@ def test_iter_replay_records_reads_directory_in_rotation_order(tmp_path) -> None
         json.dumps({"request_id": "a", "request": {}, "response_usage": {}}) + "\n"
     )
     (tmp_path / "replay-0001.jsonl").write_text(
-        json.dumps({"request_id": "b", "request": {}, "response_usage": {}}) + "\n"
-        + "not json\n"
+        json.dumps({"request_id": "b", "request": {}, "response_usage": {}}) + "\n" + "not json\n"
     )
     records = list(iter_replay_records(tmp_path))
     assert [r["request_id"] for r in records] == ["a", "b"]
@@ -164,3 +162,36 @@ def test_get_replay_capture_ignores_bad_max_bytes(tmp_path, monkeypatch) -> None
     from headroom.proxy.replay_capture import DEFAULT_MAX_FILE_BYTES
 
     assert capture._max_file_bytes == DEFAULT_MAX_FILE_BYTES
+
+
+def test_restart_resumes_at_the_open_tail(tmp_path) -> None:
+    """A new writer must not touch the full files an earlier one left behind."""
+    first = ReplayCapture(tmp_path, max_file_bytes=100)
+    for i in range(3):
+        first.record(
+            request_body={"i": i, "padding": "x" * 80},
+            response_usage={},
+            transforms_applied=[],
+            model="m",
+            request_id=f"req-{i}",
+            provider="anthropic",
+            timestamp=float(i),
+        )
+    before = {f.name: f.read_bytes() for f in tmp_path.glob("*.jsonl")}
+    assert len(before) == 3
+
+    second = ReplayCapture(tmp_path, max_file_bytes=100)
+    second.record(
+        request_body={"i": 99, "padding": "x" * 80},
+        response_usage={},
+        transforms_applied=[],
+        model="m",
+        request_id="req-99",
+        provider="anthropic",
+        timestamp=99.0,
+    )
+    after = {f.name: f.read_bytes() for f in tmp_path.glob("*.jsonl")}
+    for name, content in before.items():
+        assert after[name] == content
+    assert sorted(after) == sorted(before) + ["replay-0003.jsonl"]
+    assert json.loads(after["replay-0003.jsonl"])["request_id"] == "req-99"

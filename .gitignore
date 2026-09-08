@@ -272,3 +272,5 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+!scripts/oracle_replay.py
+!scripts/replay_driver.py

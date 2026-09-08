@@ -2,9 +2,11 @@
 """Hindsight-optimal replay of logged sessions: how much did the live
 prefix-mutation policy leave on the table?
 
-Reads the persistent savings history (``~/.headroom/proxy_savings.json``),
-reconstructs per-session turn series from the cumulative counters, and runs a
-small dynamic program that picks the cost-optimal compress/hold decision per
+Reads the replay corpus (``~/.headroom/replay``, one record per forwarded
+request with the billed usage block) when it exists, else the persistent
+savings history (``~/.headroom/proxy_savings.json``, cumulative counters
+capped at 5000 points, so only the last few days). Either way it rebuilds
+per-session turn series and runs a small dynamic program that picks the cost-optimal compress/hold decision per
 turn with full knowledge of the future. The gap between the oracle's cost and
 the actual recorded cost is the total budget available to ANY smarter online
 policy. If the gap is small, the current gate is near-optimal and further
@@ -14,10 +16,13 @@ job, it changes nothing.
 Model and its assumptions (all approximations, stated so the number is read
 with the right error bars):
 
-* Turn series come from deltas of cumulative per-model counters. Session
-  boundaries are idle gaps above ``--session-gap`` seconds. Requests from
-  concurrent sessions of the same model interleave; treat per-session numbers
-  as indicative and the aggregate as the headline.
+* Corpus turns carry the provider's own usage split per request and are
+  grouped on the Claude Code session id plus model, so they are exact
+  lineages. Savings-history turns come from deltas of cumulative per-model
+  counters with session boundaries at idle gaps above ``--session-gap``
+  seconds, and concurrent sessions of the same model interleave there, so
+  treat those per-session numbers as indicative and the aggregate as the
+  headline.
 * Prices are normalized to input-token units: cache read 0.1, 5m write 1.25,
   1h write 2.0 (Anthropic multipliers). The oracle state is (compressed?,
   ttl tier), transitions charge a full prefix re-write on compress and read
@@ -30,16 +35,23 @@ Usage::
 
     uv run python scripts/oracle_replay.py
     uv run python scripts/oracle_replay.py --model claude-fable-5 --days 3
+    uv run python scripts/oracle_replay.py --source savings
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+DEFAULT_CORPUS = Path.home() / ".headroom" / "replay"
 READ_MULT = 0.10
 WRITE_MULT = {"5m": 1.25, "1h": 2.00}
 
@@ -109,6 +121,47 @@ def sessions_from_history(entries: list[dict], session_gap_s: float) -> list[Ses
     return sessions
 
 
+def sessions_from_corpus(
+    source: Path,
+    *,
+    model_filter: str | None,
+    days: float | None,
+    min_turns: int,
+    include_haiku: bool,
+) -> list[Session]:
+    """Exact lineages from the replay corpus, one per session id and model."""
+    from headroom.proxy.replay_audit import group_sessions
+    from headroom.proxy.replay_capture import iter_replay_records
+
+    groups = group_sessions(
+        iter_replay_records(source),
+        min_turns=min_turns,
+        model_filter=model_filter,
+        exclude_model_prefixes=() if include_haiku else ("claude-haiku",),
+    )
+    if not groups:
+        return []
+    floor: float | None = None
+    if days is not None:
+        last = max(t.timestamp for turns in groups.values() for t in turns)
+        floor = last - days * 86400.0
+    sessions: list[Session] = []
+    for (_, model), turns in sorted(groups.items(), key=lambda kv: kv[1][0].timestamp):
+        series = [
+            Turn(
+                datetime.fromtimestamp(t.timestamp, tz=timezone.utc),
+                t.billed_input,
+                t.cache_read,
+                0.0,
+            )
+            for t in turns
+            if floor is None or t.timestamp >= floor
+        ]
+        if len(series) >= min_turns:
+            sessions.append(Session(model, series))
+    return sessions
+
+
 def oracle_cost_tokens(turns: list[Turn], kept: float, ttl: str) -> float:
     """Minimal token-unit cost of serving the observed turn sizes in hindsight.
 
@@ -174,6 +227,19 @@ def main() -> None:
         type=Path,
         default=Path.home() / ".headroom" / "proxy_savings.json",
     )
+    parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
+    parser.add_argument(
+        "--source",
+        choices=("auto", "corpus", "savings"),
+        default="auto",
+        help="auto uses the corpus when the directory exists, else the savings history",
+    )
+    parser.add_argument("--min-turns", type=int, default=3)
+    parser.add_argument(
+        "--include-haiku",
+        action="store_true",
+        help="Keep Haiku side calls (titles, summaries), which are not prefix lineages",
+    )
     parser.add_argument("--model", default=None, help="Filter to one model id")
     parser.add_argument("--days", type=float, default=None, help="Only the last N days")
     parser.add_argument(
@@ -191,18 +257,29 @@ def main() -> None:
     parser.add_argument("--ttl", choices=("5m", "1h"), default="5m")
     args = parser.parse_args()
 
-    entries = load_history(args.savings, args.days, args.model)
-    if not entries:
-        print("no history entries matched")
-        return
-    sessions = sessions_from_history(entries, args.session_gap)
+    use_corpus = args.source == "corpus" or (args.source == "auto" and args.corpus.is_dir())
+    if use_corpus:
+        sessions = sessions_from_corpus(
+            args.corpus,
+            model_filter=args.model,
+            days=args.days,
+            min_turns=args.min_turns,
+            include_haiku=args.include_haiku,
+        )
+        print(f"source: corpus {args.corpus}")
+    else:
+        entries = load_history(args.savings, args.days, args.model)
+        if not entries:
+            print("no history entries matched")
+            return
+        sessions = sessions_from_history(entries, args.session_gap)
+        print(f"source: savings history {args.savings}")
     if not sessions:
-        print("no sessions reconstructed (need 3+ turns per session)")
+        print(f"no sessions reconstructed (need {args.min_turns}+ turns per session)")
         return
 
     print(
-        f"{'model':<20}{'turns':>6}{'actual(tok-units)':>19}"
-        f"{'oracle(tok-units)':>19}{'regret':>9}"
+        f"{'model':<20}{'turns':>6}{'actual(tok-units)':>19}{'oracle(tok-units)':>19}{'regret':>9}"
     )
     total_actual = 0.0
     total_oracle = 0.0
@@ -212,10 +289,7 @@ def main() -> None:
         total_actual += actual
         total_oracle += oracle
         regret = (actual - oracle) / actual if actual > 0 else 0.0
-        print(
-            f"{s.model:<20}{len(s.turns):>6}{actual:>19,.0f}"
-            f"{oracle:>19,.0f}{regret:>8.1%}"
-        )
+        print(f"{s.model:<20}{len(s.turns):>6}{actual:>19,.0f}{oracle:>19,.0f}{regret:>8.1%}")
     agg = (total_actual - total_oracle) / total_actual if total_actual else 0.0
     print(
         f"\naggregate: actual={total_actual:,.0f} oracle={total_oracle:,.0f} "

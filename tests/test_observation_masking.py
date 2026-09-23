@@ -258,3 +258,34 @@ def test_gate_prices_through_the_real_policy():
     assert gain == policy.net_mutation_gain(
         candidates[0].tokens_saved, 10, 4, 0.5, write_multiplier=CACHE_WRITE_MULTIPLIER_1H
     )
+
+
+def test_skip_result_tools_leaves_owned_results_alone():
+    """Read maturation owns Read results while it runs, so masking must not
+    replace a Read before maturation's quiet turns have passed."""
+    messages = _messages("word " * 30)
+    assert discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    assert not discover_candidates(
+        messages,
+        count_tokens=_count,
+        mask_min_tokens=10,
+        skip_result_tools=frozenset({"Read"}),
+    )
+
+
+def test_mask_replay_ledger_books_each_masked_block_once():
+    """The client re-sends the raw block every turn, so the masked copy goes out
+    again each request. Only the first appearance may count as a saving."""
+    from headroom.transforms.observation_masking import MaskReplayLedger
+
+    original = _messages("word " * 30)
+    candidates = discover_candidates(original, count_tokens=_count, mask_min_tokens=10)
+    masked = apply_candidates(original, candidates, compression_store=_Store()).messages
+    ledger = MaskReplayLedger()
+
+    assert ledger.replayed_token_debt(original, masked, _count) == 0
+    expected = _count("word " * 30) - _count(candidates[0].marker)
+    assert ledger.replayed_token_debt(original, masked, _count) == expected
+    assert ledger.replayed_token_debt(original, masked, _count) == expected
+    # A turn that forwards the block unmasked owes nothing.
+    assert ledger.replayed_token_debt(original, original, _count) == 0

@@ -1361,6 +1361,9 @@ class PrefixCacheTracker:
         # lazily by the handler when read maturation is enabled. Rides
         # here so it shares the session's affinity and TTL cleanup.
         self.read_maturation_manager: Any = None
+        # Observation-masking twin of the above: which masked blocks this
+        # session has already booked, so a replay is not counted again.
+        self.mask_replay_ledger: Any = None
 
         # The output-shaping verbosity level this conversation's forwarded
         # system prompt was established at, or ``None`` if the handler has

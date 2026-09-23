@@ -2049,6 +2049,14 @@ class AnthropicHandlerMixin:
             preserve_tool_order = _bypass or not self.config.optimize
             if _bypass:
                 logger.info(f"[{request_id}] Bypass: skipping compression (header)")
+            # Read maturation owns Read results while it runs (same condition as
+            # the maturation pass below), so observation masking leaves them
+            # alone rather than replacing a fresh Read before its quiet turns.
+            _masking_skip_tools: frozenset[str] = frozenset()
+            if self.config.read_maturation and not _bypass:
+                from headroom.transforms.read_maturation import READ_TOOL_NAMES
+
+                _masking_skip_tools = READ_TOOL_NAMES
 
             # Cost-aware model routing (#1706). Opt-in and disabled by default;
             # fail-closed and bypass handling live in the helper. A model override
@@ -3013,6 +3021,7 @@ class AnthropicHandlerMixin:
                             mask_min_tokens=getattr(_masking_config, "mask_min_tokens", 150),
                             mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
                             episode_closed_turn=_closed_turn,
+                            skip_result_tools=_masking_skip_tools,
                         )
                         if not _mask_candidates:
                             _tr_shapes: dict[str, int] = {}
@@ -3131,6 +3140,7 @@ class AnthropicHandlerMixin:
                                 ),
                                 mask_input_keys=_MASKABLE_INPUT_KEYS if _mask_tool_inputs else (),
                                 episode_closed_turn=_closed_turn,
+                                skip_result_tools=_masking_skip_tools,
                             )
                             _mask_candidates = _bust_candidates
 
@@ -3232,6 +3242,7 @@ class AnthropicHandlerMixin:
                                 count_tokens=tokenizer.count_text,
                                 mask_after_turns=getattr(_masking_config, "mask_after_turns", 2),
                                 mask_min_tokens=getattr(_masking_config, "mask_min_tokens", 150),
+                                skip_result_tools=_masking_skip_tools,
                             )
                             if not _mask_candidates:
                                 # Zero candidates on a large session means the
@@ -5286,6 +5297,22 @@ class AnthropicHandlerMixin:
                         # Advisory, like the maturation pass itself: a failure
                         # here must not skip the recount around it.
                         logger.debug("maturation replay debt skipped", exc_info=True)
+                # Same first-appearance rule for observation masking, which
+                # re-masks the raw client copy of a block on every turn. The
+                # ledger rides on the tracker so it shares the session's
+                # lifetime, like the maturation manager.
+                try:
+                    _mask_ledger = getattr(prefix_tracker, "mask_replay_ledger", None)
+                    if _mask_ledger is None:
+                        from headroom.transforms.observation_masking import MaskReplayLedger
+
+                        _mask_ledger = MaskReplayLedger()
+                        prefix_tracker.mask_replay_ledger = _mask_ledger
+                    _replay_debt += _mask_ledger.replayed_token_debt(
+                        _orig_snapshot, optimized_messages, tokenizer.count_text
+                    )
+                except Exception:
+                    logger.debug("masking replay debt skipped", exc_info=True)
                 tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above

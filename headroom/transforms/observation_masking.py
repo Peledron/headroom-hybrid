@@ -407,8 +407,14 @@ def discover_candidates(
     mask_min_tokens: int = 400,
     mask_input_keys: tuple[str, ...] = (),
     episode_closed_turn: int | None = None,
+    skip_result_tools: frozenset[str] = frozenset(),
 ) -> list[MaskCandidate]:
     """Prepare eligible markers without mutating messages or writing CCR.
+
+    ``skip_result_tools`` names tools whose results another transform owns.
+    The handler passes the Read tools while read maturation runs: maturation
+    holds a fresh Read for ``quiesce_turns`` quiet turns before replacing it,
+    and masking the same block first would cut that wait short.
 
     ``episode_closed_turn`` names the assistant turn where the last finished
     task ended (see ``closed_episode_turn``). Results produced before it skip
@@ -430,6 +436,8 @@ def discover_candidates(
         text_block: bool = False,
     ) -> MaskCandidate | None:
         if _already_compact(original):
+            return None
+        if input_key is None and tool_name in skip_result_tools:
             return None
         # Results only. A tool input sits where the model generates, and the
         # 2026-07-17 mimicry incident came from marker text landing there; the
@@ -660,3 +668,78 @@ def apply_candidates(
         tokens_saved=tokens_saved,
         bytes_saved=max(0, bytes_saved),
     )
+
+
+def _masked_values(messages: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
+    """Maskable text per slot: ``(tool_use_id, "")`` for a tool result and
+    ``(tool_use_id, key)`` for a tool_use input field. Same shapes
+    discover_candidates reads, so a masked slot and its original line up."""
+    values: dict[tuple[str, str], str] = {}
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                inner = block.get("content")
+                if (
+                    isinstance(inner, list)
+                    and len(inner) == 1
+                    and isinstance(inner[0], dict)
+                    and inner[0].get("type") == "text"
+                ):
+                    inner = inner[0].get("text")
+                if isinstance(inner, str):
+                    values[(str(block.get("tool_use_id", "")), "")] = inner
+            elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                for key, value in block["input"].items():
+                    if isinstance(value, str):
+                        values[(str(block.get("id", "")), str(key))] = value
+    return values
+
+
+class MaskReplayLedger:
+    """Books each masked block once per session.
+
+    The client re-sends the raw conversation every turn and masking replaces
+    the same block again, so a plain original-vs-forwarded diff books one
+    masking on every request until the session ends. This is the masking twin
+    of ``ReadMaturationManager.replayed_token_debt``: the first turn a slot
+    goes out masked books in full, and every later turn is returned as debt.
+    """
+
+    def __init__(self) -> None:
+        self._booked: set[tuple[str, str]] = set()
+        self._deltas: dict[tuple[str, str], int] = {}
+
+    def replayed_token_debt(
+        self,
+        original_messages: list[dict[str, Any]],
+        outbound_messages: list[dict[str, Any]],
+        count_text: Callable[[str], int],
+    ) -> int:
+        """Tokens this request re-saved by re-masking an already-booked slot.
+
+        Call once per request on the final outbound messages. The first
+        booking is recorded as a side effect, so a second call would charge
+        the request for its own first appearance.
+        """
+        forwarded = _masked_values(outbound_messages)
+        debt = 0
+        for slot, original in _masked_values(original_messages).items():
+            sent = forwarded.get(slot)
+            if sent is None or sent == original:
+                continue
+            if not (sent.startswith(MASK_PREFIX) or sent.startswith(INPUT_MASK_PREFIX)):
+                continue
+            if slot not in self._booked:
+                self._booked.add(slot)
+                continue
+            delta = self._deltas.get(slot)
+            if delta is None:
+                delta = max(0, int(count_text(original)) - int(count_text(sent)))
+                self._deltas[slot] = delta
+            debt += delta
+        return debt

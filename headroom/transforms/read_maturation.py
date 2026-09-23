@@ -63,6 +63,9 @@ logger = logging.getLogger(__name__)
 
 # Tool names whose results are eligible for maturation.
 _READ_TOOLS = frozenset({"Read", "read"})
+#: Public name for the tools whose results this module owns, so masking can
+#: leave them alone while maturation runs.
+READ_TOOL_NAMES = _READ_TOOLS
 # Tool names that count as file activity (reset the quiet clock).
 _TOUCH_TOOLS = frozenset(
     {"Read", "read", "Edit", "edit", "Write", "write", "MultiEdit", "NotebookEdit"}

@@ -14,7 +14,11 @@ import time
 import pytest
 
 from headroom.cache.backends.sqlite import SQLiteBackend
-from headroom.cache.compression_store import CompressionEntry, CompressionStore
+from headroom.cache.compression_store import (
+    CompressionEntry,
+    CompressionStore,
+    format_retrieval_miss_detail,
+)
 
 
 def make_entry(hash_key: str = "h1", content: str = "x" * 600, ttl: int = 86400) -> CompressionEntry:
@@ -104,7 +108,8 @@ class TestSQLiteBackend:
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
             )
         }
-        assert indexes == {"idx_ccr_expiry_deadline"}
+        assert "idx_ccr_expiry" not in indexes
+        assert {"idx_ccr_expiry_deadline", "idx_ccr_expires_at"} <= indexes
         entry = b.get("h1")
         assert entry is not None
         assert entry.original_content == make_entry("h1").original_content
@@ -254,6 +259,30 @@ class TestMultiWorkerSafety:
         reopened = SQLiteBackend(db_path)
         assert not reopened.exists("old")  # swept at open
         assert reopened.exists("fresh")
+
+    def test_backend_purge_leaves_no_reason_and_the_miss_says_so(self, db_path):
+        """A restart loses the removal reason, and the miss text must admit it.
+
+        CompressionStore's tombstone ring is process-local, and the sweep above
+        runs inside the *backend*: by the time a restarted process asks about
+        the hash, the row is gone and nothing recorded why. Reporting the bare
+        "never stored by this store" there would be a lie — the entry was
+        stored, and it expired. The miss has to name both possibilities.
+        """
+        first = CompressionStore(backend=SQLiteBackend(db_path))
+        expired = make_entry(ttl=1)
+        expired.created_at = time.time() - 10
+        first._backend.set("h1", expired)
+        del first  # the tombstone ring does not outlive the process
+
+        # Restart: a fresh backend sweeps "h1" on open, into a fresh store.
+        restarted = CompressionStore(backend=SQLiteBackend(db_path))
+        status = restarted.get_entry_status("h1")
+
+        assert status["status"] == "missing"
+        detail = format_retrieval_miss_detail(status)
+        assert "Entry not found" in detail
+        assert "expired/evicted with no reason recorded" in detail
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX permissions")
     def test_database_file_is_private(self, db_path):

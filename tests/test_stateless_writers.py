@@ -641,9 +641,17 @@ def test_expired_entry_detail_is_unchanged(_reset_ccr_store):
     from headroom.cache.compression_store import format_retrieval_miss_detail
 
     detail = format_retrieval_miss_detail(
-        {"status": "expired", "ttl_seconds": 1800, "age_seconds": 2000.0}
+        {
+            "status": "expired",
+            "ttl_seconds": 1800,
+            "age_seconds": 2000.0,
+            "idle_seconds": 2000.0,
+            "store_is_process_local": True,
+        }
     )
-    assert detail == "Entry expired (CCR TTL: 1800 seconds; age: 2000 seconds)"
+    # Idle-window wording from #2604, and no process-local note: the entry was
+    # found, so the store was not the reason.
+    assert detail == "Entry expired (CCR idle TTL: 1800 seconds; idle: 2000 seconds)"
 
 
 def test_ccr_miss_message_does_not_blame_ttl_alone():

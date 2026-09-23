@@ -59,11 +59,12 @@ pub trait CcrStore: Send + Sync {
 /// Default capacity — matches Python's `CompressionStore` default.
 pub const DEFAULT_CAPACITY: usize = 1000;
 
-/// Default TTL — 30 minutes, matching Python
-/// (`CCRConfig.store_ttl_seconds`). Session-scale: agentic sessions
-/// routinely outlive the old 5-minute default, and an expired entry
-/// silently converts "lossless with retrieval" into "lossy".
-pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
+/// Default TTL, 24 hours, matching Python (`CCRConfig.store_ttl_seconds`).
+/// Whole-session scale: an entry must outlive the transcript that quotes its
+/// marker, and an expired entry silently converts "lossless with retrieval"
+/// into "lossy" (#2604). This is the idle window, not a lifetime, see
+/// `DEFAULT_MAX_LIFETIME_MULTIPLIER`.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(86400);
 
 /// The TTL is an **idle window**, not a wall clock: every successful
 /// `get` restarts the entry's clock, so an entry a session keeps

@@ -95,8 +95,8 @@ class TestDefaultPathRegressionGuard:
         for dt, suf, reads, alive in itertools.product(
             self.GRID_DT, self.GRID_SUFFIX, self.GRID_READS, self.GRID_ALIVE
         ):
-            a = policy.net_mutation_gain(dt, suf, reads, alive, None)
-            b = policy.net_mutation_gain(dt, suf, reads, alive, CACHE_WRITE_MULTIPLIER)
+            a = policy.net_mutation_gain(dt, suf, reads, alive, write_multiplier=None)
+            b = policy.net_mutation_gain(dt, suf, reads, alive, write_multiplier=CACHE_WRITE_MULTIPLIER)
             same = a == b or (math.isnan(a) and math.isnan(b))
             if not same:
                 mismatches.append((dt, suf, reads, alive, a, b))
@@ -107,8 +107,8 @@ class TestDefaultPathRegressionGuard:
         for dt, suf, reads, alive in itertools.product(
             self.GRID_DT, self.GRID_SUFFIX, self.GRID_READS, self.GRID_ALIVE
         ):
-            a = policy.should_mutate_deep(dt, suf, reads, alive, None)
-            b = policy.should_mutate_deep(dt, suf, reads, alive, CACHE_WRITE_MULTIPLIER)
+            a = policy.should_mutate_deep(dt, suf, reads, alive, write_multiplier=None)
+            b = policy.should_mutate_deep(dt, suf, reads, alive, write_multiplier=CACHE_WRITE_MULTIPLIER)
             if a != b:
                 mismatches.append((dt, suf, reads, alive, a, b))
         assert not mismatches, f"default-path decision divergence at: {mismatches[:10]}"
@@ -116,8 +116,8 @@ class TestDefaultPathRegressionGuard:
     def test_break_even_reads_none_equals_explicit_1_25(self, policy):
         mismatches = []
         for dt, suf in itertools.product(self.GRID_DT, self.GRID_SUFFIX):
-            a = policy.break_even_reads(dt, suf, None)
-            b = policy.break_even_reads(dt, suf, CACHE_WRITE_MULTIPLIER)
+            a = policy.break_even_reads(dt, suf, write_multiplier=None)
+            b = policy.break_even_reads(dt, suf, write_multiplier=CACHE_WRITE_MULTIPLIER)
             if a != b:
                 mismatches.append((dt, suf, a, b))
         assert not mismatches, f"default-path break_even_reads divergence at: {mismatches[:10]}"
@@ -235,8 +235,8 @@ class TestMonotonicityWarmBust:
             [0, 1, 100, 10_000, 50_000, 10**8],
             [0.0, 1, 10, 287.5, 1000, 1e6],
         ):
-            gain_5m = policy.net_mutation_gain(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER)
-            gain_1h = policy.net_mutation_gain(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER_1H)
+            gain_5m = policy.net_mutation_gain(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER)
+            gain_1h = policy.net_mutation_gain(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER_1H)
             if gain_1h > gain_5m:
                 violations.append((dt, suf, reads, gain_5m, gain_1h))
         assert not violations, f"1h tier scored HIGHER than 5m tier at: {violations[:10]}"
@@ -247,14 +247,14 @@ class TestMonotonicityWarmBust:
         for dt, suf, reads in itertools.product(
             [1, 1000, 50_000], [1, 100, 50_000], [0.0, 10, 1000]
         ):
-            gain_5m = policy.net_mutation_gain(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER)
-            gain_1h = policy.net_mutation_gain(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER_1H)
+            gain_5m = policy.net_mutation_gain(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER)
+            gain_1h = policy.net_mutation_gain(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER_1H)
             assert gain_1h < gain_5m, f"not strictly lower at dt={dt} suf={suf} reads={reads}"
 
     def test_break_even_reads_higher_for_1h_tier(self, policy):
         for dt, suf in itertools.product([1, 1000, 50_000], [1, 100, 50_000]):
-            be_5m = policy.break_even_reads(dt, suf, CACHE_WRITE_MULTIPLIER)
-            be_1h = policy.break_even_reads(dt, suf, CACHE_WRITE_MULTIPLIER_1H)
+            be_5m = policy.break_even_reads(dt, suf, write_multiplier=CACHE_WRITE_MULTIPLIER)
+            be_1h = policy.break_even_reads(dt, suf, write_multiplier=CACHE_WRITE_MULTIPLIER_1H)
             assert be_1h > be_5m, f"1h break-even not higher at dt={dt} suf={suf}"
 
     def test_break_even_ratio_is_exactly_19_over_11_5(self, policy):
@@ -265,8 +265,8 @@ class TestMonotonicityWarmBust:
         )
         assert expected_ratio == pytest.approx(19.0 / 11.5, rel=1e-9)
         for dt, suf in itertools.product([1, 7, 1000, 50_000], [1, 3, 100, 50_000]):
-            be_5m = policy.break_even_reads(dt, suf, CACHE_WRITE_MULTIPLIER)
-            be_1h = policy.break_even_reads(dt, suf, CACHE_WRITE_MULTIPLIER_1H)
+            be_5m = policy.break_even_reads(dt, suf, write_multiplier=CACHE_WRITE_MULTIPLIER)
+            be_1h = policy.break_even_reads(dt, suf, write_multiplier=CACHE_WRITE_MULTIPLIER_1H)
             assert be_1h / be_5m == pytest.approx(expected_ratio, rel=1e-9)
 
     def test_1h_tier_can_flip_an_admit_into_a_reject(self, policy):
@@ -274,8 +274,8 @@ class TestMonotonicityWarmBust:
         # scenario that admits at the 5m rate must reject at the 1h rate
         # for some achievable (dt, suffix, reads).
         dt, suf, reads = 1000, 15_000, 200  # break-even: 172.5 (5m) / 285 (1h)
-        assert policy.should_mutate_deep(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER) is True
-        assert policy.should_mutate_deep(dt, suf, reads, 1.0, CACHE_WRITE_MULTIPLIER_1H) is False
+        assert policy.should_mutate_deep(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER) is True
+        assert policy.should_mutate_deep(dt, suf, reads, 1.0, write_multiplier=CACHE_WRITE_MULTIPLIER_1H) is False
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -375,27 +375,27 @@ class TestAbsurdWriteMultiplierClamping:
     DT, SUF, READS, ALIVE = 1000, 50_000, 1.0, 1.0
 
     def test_sane_multipliers_reject_as_baseline(self, policy):
-        assert policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, 1.25) < 0
-        assert policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, 2.0) < 0
+        assert policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=1.25) < 0
+        assert policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=2.0) < 0
 
     def test_nan_write_multiplier_fails_closed(self, policy):
-        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, float("nan"))
+        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=float("nan"))
         assert math.isnan(gain)
-        assert policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, float("nan")) is False
+        assert policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=float("nan")) is False
 
     def test_positive_infinite_write_multiplier_fails_closed(self, policy):
-        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, float("inf"))
+        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=float("inf"))
         # inf - inf during the subtraction of two divergent terms -> nan;
         # should_mutate_deep must still not admit.
         assert math.isnan(gain) or gain <= 0
         assert (
-            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, float("inf"))
+            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=float("inf"))
             is False
         )
 
     def test_negative_infinite_write_multiplier_fails_closed(self, policy):
         assert (
-            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, float("-inf"))
+            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=float("-inf"))
             is False
         )
 
@@ -414,8 +414,8 @@ class TestAbsurdWriteMultiplierClamping:
         1.25-tier baseline (see test_sane_multipliers_reject_as_baseline) and
         the gate correctly refuses to admit.
         """
-        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, w)
-        admitted = policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, w)
+        gain = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=w)
+        admitted = policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=w)
         assert gain < 0, f"expected the clamped (sane) negative gain at w={w}, got {gain}"
         assert admitted is False
 
@@ -427,7 +427,7 @@ class TestAbsurdWriteMultiplierClamping:
         ``_clamp_write_multiplier`` floor now applies here too, so w <= 0
         clamps to 1.25 and break_even_reads returns the same non-negative
         value as the sane 1.25-tier baseline."""
-        be = policy.break_even_reads(self.DT, self.SUF, w)
+        be = policy.break_even_reads(self.DT, self.SUF, write_multiplier=w)
         assert be >= 0, f"expected a non-negative break-even at w={w}, got {be}"
 
     def test_huge_positive_write_multiplier_stays_conservative_when_suffix_positive(
@@ -438,11 +438,11 @@ class TestAbsurdWriteMultiplierClamping:
         # grows, for p_alive=1 and suffix>0), consistent with the
         # monotonicity claim in section 3. This isolates the negative/zero
         # case above as the actual defect, not "any extreme w".
-        gain_normal = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, 1.25)
-        gain_huge = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, 1e6)
+        gain_normal = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=1.25)
+        gain_huge = policy.net_mutation_gain(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=1e6)
         assert gain_huge < gain_normal < 0
         assert (
-            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, 1e6) is False
+            policy.should_mutate_deep(self.DT, self.SUF, self.READS, self.ALIVE, write_multiplier=1e6) is False
         )
 
     def test_zero_suffix_makes_gain_independent_of_write_multiplier_at_full_alive(self, policy):
@@ -453,9 +453,9 @@ class TestAbsurdWriteMultiplierClamping:
         # (batch reclaim intentionally charges no incremental write cost)
         # and is not itself a new bug, but it means the multiplier choice
         # is silently inert whenever the caller charges S=0.
-        g1 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, 1.25)
-        g2 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, 2.0)
-        g3 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, -500.0)
+        g1 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, write_multiplier=1.25)
+        g2 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, write_multiplier=2.0)
+        g3 = policy.net_mutation_gain(1000, 0, 10.0, 1.0, write_multiplier=-500.0)
         assert g1 == g2 == g3
 
     def test_clamped_write_multiplier_via_net_cost_allows_end_to_end(self, router, monkeypatch):

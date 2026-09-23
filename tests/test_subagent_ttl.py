@@ -287,7 +287,7 @@ def _gate_decision(policy, *, orig, cached, kept, R, ttl, idle):
     w = _wmt(ttl)
     ttl_s = 3600.0 if ttl == "1h" else 300.0
     p_alive = max(0.0, 1.0 - idle / ttl_s)
-    gain = policy.net_mutation_gain(est_dt, cached, R, p_alive, w)
+    gain = policy.net_mutation_gain(est_dt, cached, R, p_alive, write_multiplier=w)
     return gain
 
 

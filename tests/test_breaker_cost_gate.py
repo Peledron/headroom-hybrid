@@ -55,7 +55,7 @@ def _handler_gate(
     w = write_multiplier_for_ttl(ttl_resolved)
     ttl_s = 3600.0 if ttl_resolved == "1h" else 300.0
     p_alive = max(0.0, 1.0 - (idle or 0.0) / ttl_s)
-    gain = policy.net_mutation_gain(est_dt, S, R, p_alive, w)
+    gain = policy.net_mutation_gain(est_dt, S, R, p_alive, write_multiplier=w)
     pressure = original_tokens / context_limit
     should_compress = gain > 0.0 or pressure >= pressure_threshold
     return gain, pressure, should_compress
@@ -326,12 +326,12 @@ def test_bad_prior_estimate_flips_gain_sign_between_decision_and_reality():
 
     est_kept = 0.5
     est_dt = int(orig * (1.0 - est_kept))
-    gain_estimated = p.net_mutation_gain(est_dt, S, R, p_alive, w)
+    gain_estimated = p.net_mutation_gain(est_dt, S, R, p_alive, write_multiplier=w)
     assert gain_estimated > 0.0  # gate decides: compress (and would latch)
 
     real_kept = 0.95
     real_dt = int(orig * (1.0 - real_kept))
-    gain_real = p.net_mutation_gain(real_dt, S, R, p_alive, w)
+    gain_real = p.net_mutation_gain(real_dt, S, R, p_alive, write_multiplier=w)
     assert gain_real < 0.0  # the compression that actually ran was a net loss
 
     # Quantify: the estimate was wrong by 5x on dT, and the sign flip means
@@ -355,9 +355,9 @@ def test_bad_prior_estimate_case_two_small_margin_estimate_still_flips():
     p_alive = 1.0
 
     est_dt = int(orig * (1.0 - 0.5))  # 10000, estimate: last compression halved it
-    gain_estimated = p.net_mutation_gain(est_dt, S, R, p_alive, w)
+    gain_estimated = p.net_mutation_gain(est_dt, S, R, p_alive, write_multiplier=w)
     real_dt = int(orig * (1.0 - 0.9))  # 2000, reality: only trims 10%
-    gain_real = p.net_mutation_gain(real_dt, S, R, p_alive, w)
+    gain_real = p.net_mutation_gain(real_dt, S, R, p_alive, write_multiplier=w)
 
     assert gain_estimated > 0.0
     assert gain_real < 0.0
@@ -392,12 +392,12 @@ def test_end_of_session_turn_forces_compress_with_zero_real_reads_ahead():
     w = write_multiplier_for_ttl("5m")
     p_alive = 1.0  # fresh cache, idle == 0
 
-    honest_gain = p.net_mutation_gain(est_dt, S, 0.0, p_alive, w)
+    honest_gain = p.net_mutation_gain(est_dt, S, 0.0, p_alive, write_multiplier=w)
     assert honest_gain < 0.0  # correct answer: do not compress, nothing to amortize
 
     turn_number = 40
     proxy_R = max(R_DEFAULT_ENV, float(turn_number))
-    proxy_gain = p.net_mutation_gain(est_dt, S, proxy_R, p_alive, w)
+    proxy_gain = p.net_mutation_gain(est_dt, S, proxy_R, p_alive, write_multiplier=w)
     assert proxy_gain > 0.0  # the gate compresses anyway: a real bug
 
     # Confirm this reproduces through the literal handler transcription too.
@@ -463,8 +463,8 @@ def test_gain_sign_matches_hand_derived_break_even_at_full_alive():
     ]:
         w = write_multiplier_for_ttl(ttl)
         r_star = _hand_break_even_reads(dt, S, w)
-        below = p.net_mutation_gain(dt, S, max(r_star - 1.0, 0.0), 1.0, w)
-        above = p.net_mutation_gain(dt, S, r_star + 1.0, 1.0, w)
+        below = p.net_mutation_gain(dt, S, max(r_star - 1.0, 0.0), 1.0, write_multiplier=w)
+        above = p.net_mutation_gain(dt, S, r_star + 1.0, 1.0, write_multiplier=w)
         assert below < 0.0, (dt, S, ttl, r_star, below)
         assert above > 0.0, (dt, S, ttl, r_star, above)
 
@@ -533,7 +533,7 @@ def test_p_alive_lapse_path_clamps_at_zero_not_negative():
     # write-side term (no alive penalty at all).
     est_dt = int(50000 * (1.0 - 0.9))
     w = write_multiplier_for_ttl("5m")
-    expected = p.net_mutation_gain(est_dt, 40000, max(R_DEFAULT_ENV, 1.0), 0.0, w)
+    expected = p.net_mutation_gain(est_dt, 40000, max(R_DEFAULT_ENV, 1.0), 0.0, write_multiplier=w)
     assert gain_huge_idle == expected
 
 
@@ -565,5 +565,5 @@ def test_regime_outside_pressure_override_where_gate_still_compresses_at_a_loss(
     )
     assert pressure < PRESSURE_THRESHOLD_DEFAULT  # override is not in play
     assert should_compress is True  # yet the gate compresses anyway (via R proxy)
-    honest_gain = p.net_mutation_gain(est_dt, S, 0.0, 1.0, w)
+    honest_gain = p.net_mutation_gain(est_dt, S, 0.0, 1.0, write_multiplier=w)
     assert honest_gain < 0.0  # ...and the honest math says that is a loss

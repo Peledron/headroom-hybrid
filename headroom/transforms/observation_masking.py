@@ -100,7 +100,7 @@ def masking_gate_gain(
             suffix_tokens,
             expected_reads,
             p_alive,
-            write_multiplier,
+            write_multiplier=write_multiplier,
         )
     )
 

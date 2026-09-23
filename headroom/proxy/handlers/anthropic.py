@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
@@ -787,6 +789,8 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
+    cost_tracker: CostTracker | None = None
+
     def _start_waste_signal_task(
         self,
         result,  # noqa: ANN001
@@ -896,8 +900,8 @@ class AnthropicHandlerMixin:
 
         return await count_tokens_offloaded(self, model, messages)
 
-    @staticmethod
     def _resolve_ccr_workspace(
+        self,
         request: Any,
         body: Any,
     ) -> tuple[str, str | None]:
@@ -932,11 +936,12 @@ class AnthropicHandlerMixin:
         )
 
         try:
+            config = getattr(self, "config", None)
             ctx = _CtxFor(
                 headers=dict(request.headers),
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=resolve_memory_identity(request, default=""),
-                project_root_override=None,
+                project_root_override=(getattr(config, "memory_project_root_override", "") or None),
             )
             ident = ProjectResolver().resolve(ctx)
         except Exception as exc:  # noqa: BLE001
@@ -2109,7 +2114,9 @@ class AnthropicHandlerMixin:
                 rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
                 allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
                 if not allowed:
-                    await self.metrics.record_rate_limited(provider=provider_name)
+                    await self.metrics.record_rate_limited(
+                        provider=provider_name, source="headroom"
+                    )
                     # Unit 4: release the pre-upstream semaphore before we
                     # bail out of the handler via HTTPException — FastAPI's
                     # exception handler will NOT run our ``finally``.
@@ -2121,15 +2128,16 @@ class AnthropicHandlerMixin:
                     )
 
             # Budget check
-            if self.cost_tracker:
-                allowed, remaining = self.cost_tracker.check_budget()
+            cost_tracker = self.cost_tracker
+            if cost_tracker:
+                allowed, remaining = cost_tracker.check_budget()
                 if not allowed:
                     # Unit 4: release the pre-upstream semaphore before we
                     # bail out of the handler via HTTPException.
                     await _finalize_pre_upstream()
                     raise HTTPException(
                         status_code=429,
-                        detail=self.cost_tracker.budget_denial_detail(),
+                        detail=cost_tracker.budget_denial_detail(),
                     )
 
             # Memory: Get user ID when memory is enabled (fallback to "default" for simple DevEx).
@@ -3341,7 +3349,7 @@ class AnthropicHandlerMixin:
                             # surviving fraction still carries a bust penalty.
                             _p_alive *= client_prefix_alive_fraction
                             _gain = compression_policy.net_mutation_gain(
-                                _est_dt, _S, _R, _p_alive, _w
+                                _est_dt, _S, _R, _p_alive, write_multiplier=_w
                             )
                             try:
                                 _thr = float(
@@ -3445,60 +3453,6 @@ class AnthropicHandlerMixin:
                             _, optimized_tokens = await self._count_tokens_offloaded(
                                 model, optimized_messages
                             )
-
-                            _fast_pass = None
-                            try:
-                                async with stage_timer.measure("compression_first_stage"):
-                                    _fast_pass = await self._run_compression_in_executor(
-                                        lambda: self.anthropic_pipeline.apply(
-                                            messages=working_messages,
-                                            model=model,
-                                            model_limit=context_limit,
-                                            context=extract_user_query(working_messages),
-                                            frozen_message_count=frozen_message_count,
-                                            idle_seconds=idle_seconds,
-                                            biases=biases,
-                                            request_id=request_id,
-                                            compression_policy=compression_policy,
-                                            cache_ttl_seconds=_cc_ttl,
-                                            skip_kompress=True,
-                                            defer_waste_signals=True,
-                                            **proxy_pipeline_kwargs(self.config),
-                                        ),
-                                        timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
-                                    )
-                            except Exception as e:
-                                logger.info(
-                                    "[%s] Cold-start fast pass skipped (%s: %s); "
-                                    "deferring full pipeline to background",
-                                    request_id,
-                                    type(e).__name__,
-                                    e,
-                                )
-
-                            if _fast_pass is not None:
-                                comp_cache.update_from_result(messages, _fast_pass.messages)
-                                _fast_pass.transforms_applied = list(
-                                    _fast_pass.transforms_applied
-                                ) + [
-                                    "deferred:kompress_background"
-                                    if accepted
-                                    else "deferred:dropped"
-                                ]
-                                result = _fast_pass
-                            else:
-
-                                class _DeferredCompressionResult:
-                                    messages = working_messages
-                                    transforms_applied = [
-                                        "deferred:background_compression"
-                                        if accepted
-                                        else "deferred:dropped"
-                                    ]
-                                    timing = {}
-                                    waste_signals = None
-
-                                result = _DeferredCompressionResult()
                         else:
                             # Zone 1: Swap cached compressed versions into working copy
                             working_messages = _prep.pipeline_input
@@ -3529,11 +3483,11 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(working_messages),
                                         frozen_message_count=frozen_message_count,
+                                        prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
-                                        defer_waste_signals=True,
                                         cache_ttl_seconds=_cc_ttl,
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
@@ -3575,12 +3529,14 @@ class AnthropicHandlerMixin:
                                                 model_limit=context_limit,
                                                 context=extract_user_query(working_messages),
                                                 frozen_message_count=frozen_message_count,
+                                                prefix_replay_guaranteed=True,
                                                 idle_seconds=idle_seconds,
                                                 biases=biases,
                                                 request_id=request_id,
                                                 compression_policy=compression_policy,
                                                 skip_kompress=True,
                                                 cache_ttl_seconds=_cc_ttl,
+                                                defer_waste_signals=True,
                                                 **proxy_pipeline_kwargs(self.config),
                                             ),
                                             timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
@@ -3614,6 +3570,7 @@ class AnthropicHandlerMixin:
                                             else "deferred:dropped"
                                         ]
                                         timing = {}
+                                        waste_signals = None
 
                                     result = _DeferredCompressionResult()
                             else:
@@ -3625,11 +3582,13 @@ class AnthropicHandlerMixin:
                                             model_limit=context_limit,
                                             context=extract_user_query(working_messages),
                                             frozen_message_count=frozen_message_count,
+                                            prefix_replay_guaranteed=True,
                                             idle_seconds=idle_seconds,
                                             biases=biases,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
+                                            defer_waste_signals=True,
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -3712,6 +3671,7 @@ class AnthropicHandlerMixin:
                                     model_limit=context_limit,
                                     context=extract_user_query(messages),
                                     frozen_message_count=frozen_message_count,
+                                    prefix_replay_guaranteed=True,
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
@@ -3774,6 +3734,7 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(messages),
                                         frozen_message_count=frozen_message_count,
+                                        prefix_replay_guaranteed=True,
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
@@ -4249,6 +4210,11 @@ class AnthropicHandlerMixin:
             # request. Session state (matured markers) rides on the
             # prefix tracker — same affinity and TTL cleanup as the
             # freeze state. Advisory: must never fail the request.
+            # Bound when maturation runs, so the final accounting step below
+            # can charge this request's replayed-marker debt. Every earlier
+            # `tokens_saved` assignment is overwritten by that recount, so the
+            # adjustment belongs there and nowhere else.
+            _maturation_mgr = None
             if self.config.read_maturation and not _bypass:
                 try:
                     from headroom.config import ReadMaturationConfig
@@ -4269,6 +4235,7 @@ class AnthropicHandlerMixin:
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr
+                    _maturation_mgr = maturation_mgr
                     maturation = maturation_mgr.apply(
                         optimized_messages,
                         frozen_message_count=frozen_message_count,
@@ -5154,6 +5121,20 @@ class AnthropicHandlerMixin:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
+                # Provider headers a hook asked for (``TurnContext.provider_headers``):
+                # allow-listed names only, ``anthropic-beta`` merged behind the
+                # client's own tokens — the same reduction the gateway contract
+                # applies before handing ``headers`` to the gateway.
+                _hook_headers = getattr(_req_ctx, "provider_headers", None)
+                if isinstance(_hook_headers, dict) and _hook_headers:
+                    from headroom.proxy.turn_hooks import merge_provider_headers
+
+                    for _hh_key, _hh_value in merge_provider_headers(
+                        {"anthropic-beta": headers.get("anthropic-beta", "")}, _hook_headers
+                    ).items():
+                        if _hh_key == "anthropic-beta" and headers.get(_hh_key) != _hh_value:
+                            _headroom_beta_added = True
+                        headers[_hh_key] = _hh_value
 
             # Tool-search history repair (#2805). Once deferral is on, the client
             # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
@@ -5183,8 +5164,9 @@ class AnthropicHandlerMixin:
                 body_mutation_tracker.mark_mutated("tool_search_history_repair")
                 transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
                 logger.info(
-                    "[%s] Tool search: dropped %d unsupportable history block(s) "
-                    "(tools array cannot resolve their tool_reference entries)",
+                    "[%s] Tool search: repaired %d unsupportable history block(s) "
+                    "(replaced with text in place; tools array cannot resolve their "
+                    "tool_reference entries)",
                     request_id,
                     _ts_stripped,
                 )
@@ -5236,7 +5218,27 @@ class AnthropicHandlerMixin:
                 if 0 < _tool_tokens_after < _tool_tokens_before:
                     original_tokens += _tool_tokens_before
                     optimized_tokens += _tool_tokens_after
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # First-appearance accounting for matured Reads. The client
+                # re-sends the raw conversation every turn, so this diff would
+                # otherwise re-book a matured Read's removal on every request
+                # until end of session. Charged here, on the request's real
+                # endpoints, because after maturation the marker usually
+                # reaches the wire through the cached-prefix replay rather than
+                # through the maturation pass — and because every earlier
+                # `tokens_saved` assignment is overwritten right here.
+                # tok_before/tok_after stay the honest wire counts; only the
+                # booked saving is first-appearance.
+                _replay_debt = 0
+                if _maturation_mgr is not None:
+                    try:
+                        _replay_debt = _maturation_mgr.replayed_token_debt(
+                            _orig_snapshot, optimized_messages, tokenizer.count_text
+                        )
+                    except Exception:
+                        # Advisory, like the maturation pass itself: a failure
+                        # here must not skip the recount around it.
+                        logger.debug("maturation replay debt skipped", exc_info=True)
+                tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.
@@ -5330,6 +5332,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.output_savings import (
                     assign_arm,
                     conversation_key_from_body,
+                    conversation_label,
                     stratum_key,
                     stratum_label,
                 )
@@ -5357,7 +5360,8 @@ class AnthropicHandlerMixin:
                         _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                     except ValueError:
                         _holdout = 0.0
-                    _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                    _conversation = conversation_key_from_body(body)
+                    _arm = assign_arm(_conversation, _holdout)
 
                     # Stratum from request features observable now (mirrors the
                     # offline baseline so live and learned strata line up).
@@ -5370,7 +5374,10 @@ class AnthropicHandlerMixin:
                     )
                     # Carry (arm, stratum) on the existing label channel so the
                     # outcome funnel can feed the savings ledger from any path.
+                    # The conversation rides with it: it is the unit the arm was
+                    # assigned to, so it is the unit the estimator has to count.
                     transforms_applied.append(stratum_label(_arm, _stratum))
+                    transforms_applied.append(conversation_label(_conversation))
 
                     if _arm == "treatment":
                         _level, _src = resolve_verbosity_level(_shaper_settings)

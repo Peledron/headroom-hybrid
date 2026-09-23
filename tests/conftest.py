@@ -59,11 +59,54 @@ def _skip_proxy_dependency_gate_unless_exercised(
 
 
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch):
+def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
+    # test its own store so proxy/CLI startup cannot load developer settings and
+    # saves cannot rewrite them. Tests of path precedence can override this.
+    monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+
+
+# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
+# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
+# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
+# to the real production endpoint. Every test that reaches the outcome funnel
+# then POSTs a session event for real: observed writing into the live corpus
+# during a local run, and CI would do the same on every push.
+#
+# Depends on the scrub fixture so it is guaranteed to run after it rather than
+# relying on declaration order. A test that wants the beacon on just sets the
+# var itself — monkeypatch inside the test wins over this.
+@pytest.fixture(autouse=True)
+def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
+# The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
+# test that registers a server (directly or through `wrap`) writes into the
+# developer's REAL ledger — observed adding a live `claude/serena` entry during a
+# local run. Since the scrub above deletes HEADROOM_WORKSPACE_DIR, the default is
+# always the real home. Redirect the ledger per-test instead: every writer
+# (`record_install` / `clear_install` / `headroom_installed_matching`) resolves it
+# through this module-global, so one patch covers them all. Patched here rather
+# than pointing workspace_dir() at a tmp path, which would break the tests that
+# assert the default workspace layout.
+@pytest.fixture(autouse=True)
+def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
+    # Same guard as _reset_copilot_routing_flag below: the macos/windows-native-
+    # wrapper CI jobs install only pytest and drive the installer shell scripts
+    # via subprocess, so headroom isn't importable and there is no ledger to
+    # redirect. Skip there instead of erroring at setup.
+    try:
+        from headroom.mcp_registry import ledger
+    except ModuleNotFoundError:
+        return
+
+    ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
+    monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
 
 
 # Lineage persistence defaults to on, and its default state path is the real

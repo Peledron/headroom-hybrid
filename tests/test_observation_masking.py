@@ -231,3 +231,30 @@ def test_gate_uses_exact_masking_delta():
         write_multiplier=2,
     )
     assert gain == candidates[0].tokens_saved * 4 - 10
+
+
+def test_gate_prices_through_the_real_policy():
+    """The stub above accepts any call shape. The real policy takes
+    ``write_multiplier`` keyword-only, and a positional pass raised
+    TypeError on every gated request, which the handler swallowed as
+    "Optimization failed" and forwarded the request unoptimized."""
+    from headroom.transforms.compression_policy import (
+        CACHE_WRITE_MULTIPLIER_1H,
+        policy_default_payg,
+    )
+
+    policy = policy_default_payg()
+    candidates = discover_candidates(
+        _messages("word " * 30), count_tokens=_count, mask_min_tokens=10
+    )
+    gain = masking_gate_gain(
+        candidates,
+        compression_policy=policy,
+        suffix_tokens=10,
+        expected_reads=4,
+        p_alive=0.5,
+        write_multiplier=CACHE_WRITE_MULTIPLIER_1H,
+    )
+    assert gain == policy.net_mutation_gain(
+        candidates[0].tokens_saved, 10, 4, 0.5, write_multiplier=CACHE_WRITE_MULTIPLIER_1H
+    )

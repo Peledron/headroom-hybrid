@@ -65,9 +65,14 @@ CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 DEFAULT_CCR_MAX_ENTRIES = 50000
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
-# Previews carry verbatim tool-result content (post-redaction), which makes
-# proxy.log too sensitive for users to share in bug reports. Set to
-# 0/false/no/off to log byte counts only.
+# Previews carry verbatim tool-result content (post-redaction) — source code,
+# credentials the redactor does not recognize, customer data. That is not
+# something the always-on runtime log should hold, so previews are OFF unless
+# an operator turns them on with 1/true/yes/on; the log then records byte
+# counts only. (The log file is created owner-only either way — see
+# ``headroom/proxy/helpers.py:_OwnerOnlyRotatingFileHandler`` — because other
+# switches put request content in the same file. That is a second line of
+# defence, not a reason to log the payload.)
 PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
@@ -162,11 +167,11 @@ def _redact_retrieval_log_payload(payload: str) -> str:
 def _payload_preview_enabled() -> bool:
     """Whether the retrieval log may carry a slice of the retrieved payload.
 
-    Off under stateless mode regardless of the env var. The retrieval log goes
-    to the always-on runtime log file under the workspace, so leaving previews
-    on would put tool-result content on disk through the back door — the exact
-    thing a stateless deployment selected the flag to avoid. (The non-stateless
-    default is a separate question, tracked as its own item.)
+    Off by default, on only when an operator opts in explicitly. Always off
+    under stateless mode regardless of the env var: the retrieval log goes to
+    the always-on runtime log file under the workspace, so a preview there
+    would put tool-result content on disk, the thing a stateless deployment
+    selected the flag to avoid.
     """
     from ..paths import process_is_stateless
 
@@ -174,8 +179,8 @@ def _payload_preview_enabled() -> bool:
         return False
     raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
     if raw is None:
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:

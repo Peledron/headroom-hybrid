@@ -25,6 +25,7 @@ import math
 import os
 import time
 from collections import OrderedDict, deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -168,6 +169,26 @@ MISS_PREFIX_CHANGE = "prefix_change"
 MISS_COLD_START = "cold_start"  # no prior cached prefix to miss against
 MISS_UNKNOWN = "unknown"  # expected a hit, content stable, idle within TTL
 
+# Which segment of the cache key changed, when we can tell. Reporting the
+# earliest changed segment is what makes a prefix_change actionable: a tool-list
+# change usually means the tool set moved mid-session (an MCP server connecting
+# late, a plugin/skill loading asynchronously), a system-prompt change means the
+# prompt was rebuilt (an injected timestamp, a re-synced memory block, a per-turn
+# reminder), and a messages change means history was rewritten rather than
+# appended to. Each is a different fix.
+#
+# These are the WELL-KNOWN names, not a closed set: segment naming and ordering
+# are per-provider request shapes and belong to the caller, which is why
+# classify_cache_miss takes an open ordered mapping. For reference:
+#   * Anthropic Messages: top-level `tools` and `system`, then `messages`.
+#   * OpenAI Chat Completions: `tools`; the system prompt is messages[0], so it
+#     is already covered by the messages comparison (no separate segment).
+#   * OpenAI Responses: `tools` and `instructions`, then `input`.
+#   * Gemini: `tools` and `systemInstruction`, then `contents`.
+SEGMENT_TOOLS = "tools"
+SEGMENT_SYSTEM = "system"
+SEGMENT_MESSAGES = "messages"  # the fallback: prefix moved, no named segment did
+
 
 @dataclass
 class CacheMissAttribution:
@@ -186,6 +207,37 @@ class CacheMissAttribution:
     cache_read_tokens: int = 0
     prefix_changed: bool = False
     ttl_exceeded: bool = False
+    # Which cache-key segment diverged, when we can tell: one of the SEGMENT_*
+    # literals. ``reason == "prefix_change"`` says the bytes moved; this says
+    # WHERE, which is the difference between "unexplained" and "fixable".
+    changed_segment: str | None = None
+
+
+def segment_fingerprint(value: Any) -> str:
+    """Stable content hash for one cache-key segment (tools, system, ...).
+
+    Provider-neutral on purpose: it hashes whatever the caller hands it, so each
+    handler can pass its own request shape without this module knowing about any
+    of them.
+
+    ``cache_control`` is stripped first. Clients move the caching breakpoint from
+    turn to turn (Claude Code re-marks the newest block every call), and Headroom
+    itself re-places message markers, so the annotation flips on bytes the model
+    never sees differently. Including it would report a segment "changed" on
+    every turn and drown the real signal.
+
+    ``sort_keys`` makes the hash independent of dict ordering, so a client that
+    serializes the same tool schema with keys in a different order does not read
+    as a change.
+    """
+    canonical = json.dumps(
+        _strip_cache_control(value),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,  # never raise on an exotic value; a stable repr is enough
+    )
+    return hashlib.md5(canonical.encode()).hexdigest()[:16]  # nosec B324
 
 
 def _strip_cache_control(obj: Any) -> Any:
@@ -1324,6 +1376,14 @@ class PrefixCacheTracker:
         # this and forwards it to the pipeline as `idle_seconds`.
         self._idle_seconds_at_fetch: float = 0.0
 
+        # Hashes of the non-message cache-key segments as last forwarded, so a
+        # prefix_change can name WHICH segment moved. Segment NAMES are supplied
+        # by the caller (each provider's request shape differs — see
+        # classify_cache_miss), so this stays an open mapping rather than fixed
+        # per-provider fields. Only hashes are kept: they answer "did these exact
+        # bytes change?" without retaining a second copy of the tool schemas.
+        self._last_segment_hashes: dict[str, str] = {}
+
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
         # here so it shares the session's affinity and TTL cleanup.
@@ -1950,6 +2010,7 @@ class PrefixCacheTracker:
         cache_read_tokens: int,
         current_forwarded_messages: list[dict[str, Any]],
         idle_seconds: float | None = None,
+        segments: Mapping[str, Any] | None = None,
     ) -> CacheMissAttribution:
         """Attribute *this turn's* cache outcome: hit, TTL lapse, or prefix change.
 
@@ -1973,6 +2034,21 @@ class PrefixCacheTracker:
         * If neither signal fires (stable prefix, within TTL) we can't explain
           it from local state — ``unknown`` (e.g. provider-side eviction).
 
+        ``segments`` optionally names the non-message parts of the cache key so a
+        ``prefix_change`` can say WHICH part moved. Pass an ordered mapping of
+        ``{segment_name: forwarded_value}`` **outermost-first** — i.e. in the
+        order the provider hashes them, so the first entry that changed is the one
+        that invalidated everything after it. Names are the caller's to choose
+        (see the ``SEGMENT_*`` constants for the well-known ones and the
+        per-provider shapes); this method never inspects a request body itself.
+        Pass the values as forwarded upstream, not as received from the client —
+        those are the bytes the provider actually hashed, so Headroom's own
+        mutations are correctly attributed to Headroom.
+
+        Omitting ``segments`` keeps the previous behavior exactly: a prefix change
+        is still detected from the forwarded messages, just reported without a
+        segment name.
+
         A partial read (``0 < cache_read_tokens``) counts as a hit here; the
         existing model-aware bust detection in PrometheusMetrics already covers
         partial-invalidation accounting, and double-counting it as a "miss"
@@ -1985,6 +2061,9 @@ class PrefixCacheTracker:
             idle_seconds = self.seconds_since_activity()
         ttl = self.resolved_cache_ttl_seconds()
         expected = self._cached_token_count
+        # Always roll the segment hashes forward, hit or miss, so the next turn
+        # compares against what we actually forwarded this turn.
+        changed_segment = self._diff_segments(segments)
 
         # Nothing was cached last turn → cold start, not a miss.
         if expected <= 0:
@@ -2010,7 +2089,13 @@ class PrefixCacheTracker:
 
         # Full miss on a prefix we expected cached. Attribute it.
         ttl_exceeded = idle_seconds > ttl
-        prefix_changed = not self._forwarded_prefix_stable(current_forwarded_messages)
+        # The cache key is the WHOLE prefix, not just the message list: a changed
+        # tool schema or system prompt invalidates it while `messages` stays
+        # byte-identical. Checking only the messages filed every tools/system
+        # change under `unknown` — and tools render at position 0, so that is the
+        # class that invalidates the most and was the least explained.
+        messages_changed = not self._forwarded_prefix_stable(current_forwarded_messages)
+        prefix_changed = messages_changed or changed_segment is not None
 
         if ttl_exceeded:
             reason = MISS_TTL_EXPIRY  # TTL wins ties (see docstring)
@@ -2018,6 +2103,16 @@ class PrefixCacheTracker:
             reason = MISS_PREFIX_CHANGE
         else:
             reason = MISS_UNKNOWN
+
+        if reason == MISS_PREFIX_CHANGE:
+            # A named segment moved -> report it. Otherwise the forwarded history
+            # itself diverged, which is the messages segment by elimination.
+            changed_segment = changed_segment or SEGMENT_MESSAGES
+        else:
+            # On a TTL lapse the entry was already gone, so a coincident content
+            # change didn't cause the miss — naming it sends the reader after the
+            # wrong fix. `unknown` has nothing to name by definition.
+            changed_segment = None
 
         return CacheMissAttribution(
             is_miss=True,
@@ -2028,7 +2123,39 @@ class PrefixCacheTracker:
             cache_read_tokens=cache_read_tokens,
             prefix_changed=prefix_changed,
             ttl_exceeded=ttl_exceeded,
+            changed_segment=changed_segment,
         )
+
+    def _diff_segments(self, segments: Mapping[str, Any] | None) -> str | None:
+        """Roll segment hashes forward; return the first changed segment's name.
+
+        ``segments`` is ordered outermost-first, so the first entry whose hash
+        moved is the one that invalidated everything after it — later changes are
+        consequences, not causes, and reporting them would point at the wrong fix.
+
+        Returns ``None`` when nothing changed, when no segments were supplied, or
+        on the first turn a segment is seen (there is no baseline to compare
+        against, so we cannot claim it changed).
+
+        A call that supplies NO segments DROPS any stored baseline. Hashes only
+        roll forward on calls that pass them, so a session mixing segment-aware
+        and segment-blind calls would otherwise compare against a baseline from
+        several turns ago and report a change on the wrong turn — right culprit,
+        wrong moment. "I cannot tell" is the honest answer there, so we forget
+        instead of guessing. Sessions that always pass segments never clear, and
+        providers that never pass them have nothing to clear.
+        """
+        if not segments:
+            self._last_segment_hashes.clear()
+            return None
+        first_changed: str | None = None
+        for name, value in segments.items():
+            fingerprint = segment_fingerprint(value)
+            previous = self._last_segment_hashes.get(name)
+            self._last_segment_hashes[name] = fingerprint
+            if previous is not None and previous != fingerprint and first_changed is None:
+                first_changed = name
+        return first_changed
 
     def _forwarded_prefix_stable(self, current_forwarded_messages: list[dict[str, Any]]) -> bool:
         """True if last turn's forwarded prefix is still an exact prefix of this turn's.

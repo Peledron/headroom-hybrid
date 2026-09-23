@@ -743,6 +743,37 @@ SETTINGS: tuple[SettingField, ...] = (
         help="JSON object of extra headers merged into (and overriding) forwarded OpenAI requests.",
         tier="advanced",
     ),
+    # `headroom wrap claude` launch tuning. Registered here so they are
+    # discoverable in the settings UI/API instead of being source-only knobs —
+    # HEADROOM_WRAP_QUIET is the cautionary precedent for what happens otherwise.
+    SettingField(
+        "HEADROOM_WRAP_PREFIX_STABLE",
+        "wrap_prefix_stable",
+        "Claude Code prefix-cache stability",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "`wrap claude` only: load skills/plugins synchronously at startup "
+            "(CLAUDE_CODE_SYNC_SKILLS/SYNC_PLUGINS) so they cannot enter the prompt "
+            "mid-session and invalidate the cached prefix. Costs startup latency."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_WRAP_TRIM_PROMPT",
+        "wrap_trim_prompt",
+        "Claude Code system-prompt trims",
+        "Compression",
+        "bool",
+        default=False,
+        help=(
+            "`wrap claude` only: hide bundled skills, the built-in Claude API/Code "
+            "skills, and git instructions from the model to shrink the cached prefix. "
+            "Removes capability from the agent — off unless you want that tradeoff."
+        ),
+        tier="advanced",
+    ),
 )
 
 _BY_KEY: dict[str, SettingField] = {f.key: f for f in SETTINGS}

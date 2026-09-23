@@ -109,11 +109,17 @@ class CostEntry(NamedTuple):
 # source for cache economics, and these ratios stand in when a model publishes
 # no cache pricing. Hardcoded ratios go stale per model and per context tier
 # (Anthropic's >200k rates differ), so they are never preferred over the catalog.
+# ``write_multiplier`` is the 5-minute-TTL write price. Anthropic's 1-hour TTL
+# writes cost 2.0x base input instead of 1.25x, so a session on
+# ENABLE_PROMPT_CACHING_1H pays a 60% higher write premium than the flat 1.25x
+# implies. We already observe the 5m/1h token split per provider, so price each
+# bucket at its real rate rather than reporting 1h writes as if they were 5m.
 _CACHE_ECONOMICS = {
     "anthropic": {
         "read_multiplier": 0.1,
         "write_multiplier": 1.25,
-        "label": "Explicit breakpoints, 5-min TTL",
+        "write_multiplier_1h": 2.0,
+        "label": "Explicit breakpoints, 5-min or 1-hour TTL",
     },
     "openai": {
         "read_multiplier": 0.5,
@@ -128,6 +134,7 @@ _CACHE_ECONOMICS = {
     "bedrock": {
         "read_multiplier": 0.1,
         "write_multiplier": 1.25,
+        "write_multiplier_1h": 2.0,
         "label": "Same as Anthropic (Bedrock)",
     },
 }
@@ -186,6 +193,37 @@ def _bucket_by_cache_mix(
         Region(region),
     )
     return split.read, split.write_5m, split.write_1h, split.uncached
+
+
+def cache_write_premium_usd(
+    *,
+    write_tokens: int,
+    write_1h_tokens: int,
+    input_price_per_token: float,
+    write_mult: float,
+    write_mult_1h: float,
+) -> float:
+    """Cache-write premium in USD, priced per TTL bucket.
+
+    ``write_tokens`` is the provider total; ``write_1h_tokens`` is the part the
+    response attributed to the 1-hour bucket. Everything else is billed at the
+    5-minute rate — including tokens the provider didn't bucket, which keeps a
+    provider that reports no split behaving exactly as it did before.
+
+    Only the amount ABOVE 1.0x is a premium: a multiplier at or below 1.0x means
+    writes cost no more than uncached input, so there is nothing extra to charge.
+    """
+    if input_price_per_token <= 0 or write_tokens <= 0:
+        return 0.0
+    # Clamp: a bucket can never exceed the total it is a part of.
+    tokens_1h = max(0, min(write_1h_tokens, write_tokens))
+    tokens_5m = write_tokens - tokens_1h
+    premium = 0.0
+    if write_mult > 1.0:
+        premium += tokens_5m * input_price_per_token * (write_mult - 1.0)
+    if write_mult_1h > 1.0:
+        premium += tokens_1h * input_price_per_token * (write_mult_1h - 1.0)
+    return premium
 
 
 def _summarize_transforms(transforms: list[str]) -> str:
@@ -257,6 +295,9 @@ def build_prefix_cache_stats(
         econ = _CACHE_ECONOMICS.get(provider, _CACHE_ECONOMICS["anthropic"])
         read_mult: float = econ["read_multiplier"]  # type: ignore[assignment]
         write_mult: float = econ["write_multiplier"]  # type: ignore[assignment]
+        # Providers without a 1-hour TTL concept fall back to their 5m rate, so
+        # the per-bucket split collapses to the previous flat behavior.
+        write_mult_1h: float = econ.get("write_multiplier_1h", write_mult)  # type: ignore[assignment]
 
         # Get the base input price per token for the most-used model on this
         # provider. Pick the provider-matching, priced model with the highest
@@ -324,8 +365,21 @@ def build_prefix_cache_stats(
             # Savings from reads: tokens * price * (1.0 - read_multiplier)
             savings_usd = read_tokens * input_price_per_token * (1.0 - read_mult)
             # Write premium is reported separately and subtracted from net savings.
-            if write_mult > 1.0:
-                write_premium_usd = write_tokens * input_price_per_token * (write_mult - 1.0)
+            if pricing_source == "catalog":
+                # write_mult is already the catalog 5m and 1h rates blended by
+                # the TTL mix actually written, so it covers every write token.
+                if write_mult > 1.0:
+                    write_premium_usd = write_tokens * input_price_per_token * (write_mult - 1.0)
+            else:
+                # Ratio fallback: price each TTL bucket at its own multiplier
+                # (1h writes 2.0x, 5m writes 1.25x) instead of the flat 5m rate.
+                write_premium_usd = cache_write_premium_usd(
+                    write_tokens=write_tokens,
+                    write_1h_tokens=write_1h_tokens,
+                    input_price_per_token=input_price_per_token,
+                    write_mult=write_mult,
+                    write_mult_1h=write_mult_1h,
+                )
 
         # Token-level hit rate: what % of total input tokens were served from cache?
         # This is more meaningful than request-level (binary "had any cache read").
@@ -351,7 +405,18 @@ def build_prefix_cache_stats(
             "bust_count": pc["bust_count"],
             "bust_write_tokens": pc["bust_write_tokens"],
             "read_discount": f"{(1.0 - read_mult) * 100:.0f}%",
-            "write_premium": f"{(write_mult - 1.0) * 100:.0f}%" if write_mult > 1.0 else "none",
+            # Show the 1h rate too once the provider has actually written 1h
+            # entries, so a session on ENABLE_PROMPT_CACHING_1H can see that its
+            # writes are being billed at the higher rate.
+            "write_premium": (
+                f"{(write_mult - 1.0) * 100:.0f}% (5m) / {(write_mult_1h - 1.0) * 100:.0f}% (1h)"
+                if pricing_source != "catalog"
+                and write_1h_tokens > 0
+                and write_mult_1h != write_mult
+                else f"{(write_mult - 1.0) * 100:.0f}%"
+                if write_mult > 1.0
+                else "none"
+            ),
             "savings_usd": round(savings_usd, 4),
             "write_premium_usd": round(write_premium_usd, 4),
             "net_savings_usd": round(savings_usd - write_premium_usd, 4),

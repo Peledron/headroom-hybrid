@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
+from headroom.cache.prefix_tracker import SEGMENT_SYSTEM, SEGMENT_TOOLS
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -3252,6 +3253,34 @@ def compute_turn_id(
     h.update(b"\0")
     h.update(prefix_json.encode("utf-8", errors="replace"))
     return h.hexdigest()[:16]
+
+
+def anthropic_cache_segments(body: dict[str, Any]) -> dict[str, Any]:
+    """Anthropic's non-message cache-key segments, outermost-first.
+
+    Feeds ``PrefixCacheTracker.classify_cache_miss(segments=...)`` so a
+    ``prefix_change`` can name WHICH part of the cache key moved.
+
+    Anthropic renders the prompt as ``tools`` -> ``system`` -> ``messages``, so a
+    ``tools`` change invalidates system and messages too. Listing tools first lets
+    the attributor report the root cause instead of a downstream consequence.
+
+    Deliberately Anthropic-shaped, and deliberately NOT in ``prefix_tracker``:
+    that module is provider-neutral and shared with the OpenAI handler. OpenAI
+    Chat Completions carries the system prompt inside ``messages`` (no separate
+    segment), Responses uses ``instructions``, Gemini uses ``systemInstruction`` —
+    each handler owns its own adapter. It lives here rather than in one handler
+    because the direct, streaming, and Bedrock-streaming paths all need it.
+
+    ``body`` must be the post-mutation body actually forwarded upstream, so
+    Headroom's own tool injection / system compaction is attributed to Headroom
+    rather than blamed on the client. Bedrock shares this body shape, so the same
+    adapter is correct there.
+    """
+    return {
+        SEGMENT_TOOLS: body.get("tools"),
+        SEGMENT_SYSTEM: body.get("system"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalesci
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
+    anthropic_cache_segments,
     jitter_delay_ms,
     retry_after_ms,
 )
@@ -1124,13 +1125,16 @@ class StreamingMixin:
                 miss = prefix_tracker.classify_cache_miss(
                     cache_read_tokens=cache_read_tokens,
                     current_forwarded_messages=forwarded_messages,
+                    segments=anthropic_cache_segments(body),
                 )
                 if miss.is_miss:
                     logger.info(
                         f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
                         f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
                         f"expected_cached={miss.expected_cached_tokens:,} "
-                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
+                        f"prefix_changed={miss.prefix_changed} "
+                        f"changed_segment={miss.changed_segment} "
+                        f"ttl_exceeded={miss.ttl_exceeded}"
                     )
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
@@ -2193,6 +2197,7 @@ class StreamingMixin:
                         miss = prefix_tracker.classify_cache_miss(
                             cache_read_tokens=cache_read_tokens,
                             current_forwarded_messages=tracker_messages,
+                            segments=anthropic_cache_segments(body),
                         )
                         if miss.is_miss:
                             logger.info(
@@ -2200,6 +2205,7 @@ class StreamingMixin:
                                 f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
                                 f"expected_cached={miss.expected_cached_tokens:,} "
                                 f"prefix_changed={miss.prefix_changed} "
+                                f"changed_segment={miss.changed_segment} "
                                 f"ttl_exceeded={miss.ttl_exceeded}"
                             )
                             await self.metrics.record_cache_miss_attribution(provider, miss.reason)

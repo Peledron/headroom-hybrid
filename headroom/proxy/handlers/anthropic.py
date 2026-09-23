@@ -53,6 +53,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import (
+    anthropic_cache_segments,
     extract_tags,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
@@ -5722,6 +5723,7 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                                segments=anthropic_cache_segments(body),
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,
@@ -5736,6 +5738,7 @@ class AnthropicHandlerMixin:
                                     f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
                                     f"expected_cached={miss.expected_cached_tokens:,} "
                                     f"prefix_changed={miss.prefix_changed} "
+                                    f"changed_segment={miss.changed_segment} "
                                     f"ttl_exceeded={miss.ttl_exceeded}"
                                 )
                                 await self.metrics.record_cache_miss_attribution(
@@ -7039,6 +7042,7 @@ class AnthropicHandlerMixin:
                             miss = prefix_tracker.classify_cache_miss(
                                 cache_read_tokens=cr_tokens,
                                 current_forwarded_messages=optimized_messages,
+                                segments=anthropic_cache_segments(body),
                             )
                             from headroom.cache.ttl_observations import (
                                 record_cache_observation,
@@ -7053,6 +7057,7 @@ class AnthropicHandlerMixin:
                                     f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
                                     f"expected_cached={miss.expected_cached_tokens:,} "
                                     f"prefix_changed={miss.prefix_changed} "
+                                    f"changed_segment={miss.changed_segment} "
                                     f"ttl_exceeded={miss.ttl_exceeded}"
                                 )
                                 await self.metrics.record_cache_miss_attribution(

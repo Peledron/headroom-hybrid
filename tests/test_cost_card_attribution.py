@@ -261,3 +261,42 @@ def test_dashboard_card_shows_the_cache_discount_separately():
 
     assert "provider cache discount" in html
     assert "cost?.provider_cache_discount_usd" in html
+
+
+def test_catalog_write_premium_is_not_charged_twice_for_1h_writes():
+    """The catalog path already blends the 5m and 1h write rates by the TTL mix,
+    so every write token is priced once at that blend. Layering the per-bucket
+    ratio pricing on top charged the 1h share a second time."""
+    from headroom.proxy.cost import build_prefix_cache_stats
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.server import CostTracker
+
+    ct = CostTracker()
+    ct.record_tokens(MODEL, tokens_saved=0, tokens_sent=1_000_000, uncached_tokens=1_000_000)
+
+    metrics = PrometheusMetrics()
+    metrics.cache_by_provider["anthropic"] = {
+        "requests": 10,
+        "hit_requests": 8,
+        "cache_read_tokens": 1_000_000,
+        "cache_write_tokens": 400_000,
+        "cache_write_5m_tokens": 100_000,
+        "cache_write_1h_tokens": 300_000,
+        "cache_write_5m_requests": 2,
+        "cache_write_1h_requests": 6,
+        "uncached_input_tokens": 100_000,
+        "bust_count": 0,
+        "bust_write_tokens": 0,
+    }
+
+    stats = build_prefix_cache_stats(metrics, ct)
+    provider = stats["by_provider"]["anthropic"]
+
+    _cr, cw5, cw1h, uncached = ct._get_cache_prices(MODEL)
+    list_price = ct._get_list_price(MODEL) / 1_000_000
+    blended = (100_000 * cw5 + 300_000 * cw1h) / 400_000
+    expected = 400_000 * list_price * (blended / uncached - 1.0)
+
+    assert provider["cache_pricing_source"] == "catalog"
+    assert abs(provider["write_premium_usd"] - round(expected, 4)) < 1e-4
+    assert "(1h)" not in provider["write_premium"]

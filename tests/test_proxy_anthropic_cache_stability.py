@@ -45,7 +45,7 @@ class _MaskGatePolicy:
     def __init__(self, gain: float):
         self.gain = gain
 
-    def net_mutation_gain(self, *args):  # noqa: ANN002, ANN201
+    def net_mutation_gain(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
         return self.gain
 
 

@@ -36,6 +36,14 @@ disk, so a future basis change can re-derive the whole ledger.
 v1 events still read: they report their stored list dollar as both figures and
 carry ``basis="list"``, so a mixed ledger stays legible rather than silently
 blending two meanings.
+
+Event schema (JSONL, one object per line): every event carries ``kind``
+("compress" | "retrieve"); events missing ``kind`` (older files) are read as
+"compress". Compress events use ``before``/``after``/``saved``; retrieve events
+carry ``tokens_retrieved`` (the re-injected payload plus a fixed per-retrieval
+overhead) and leave ``before``/``after``/``saved`` at 0. Net savings are derived
+at read time in ``aggregate_savings`` (never encoded as a negative ``saved``), so
+the format stays additive and a future Rust port can read it unchanged.
 """
 
 from __future__ import annotations
@@ -277,6 +285,8 @@ def record_savings_event(
     uncached_input_tokens: Any = 0,
     cache_inferred: Any = False,
     provider: Any = None,
+    kind: str = "compress",
+    tokens_retrieved: int = 0,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -289,19 +299,29 @@ def record_savings_event(
     original list-priced meaning either way, so existing readers are unaffected.
     """
 
+    kind = str(kind or "compress")
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)
+        retrieved = max(int(tokens_retrieved), 0)
     except (TypeError, ValueError):
         return False
 
     saved = max(before - after, 0)
-    if saved <= 0:
+    if kind == "retrieve":
+        # A retrieval is a pure drawback: nothing is "saved"; it records the
+        # retrieved-back token volume so aggregate_savings can debit net.
+        if retrieved <= 0:
+            return False
+    elif saved <= 0:
         return False
 
     model_label = _normalize_model(model)
+    # Price the retrieval drawback from retrieved tokens; price compression
+    # savings from `saved`. Either way estimate_cost_usd charges the input rate.
+    cost_basis = retrieved if kind == "retrieve" else saved
     if cost_usd is None:
-        cost = estimate_cost_usd(model_label, saved, fallback_rate=fallback_rate)
+        cost = estimate_cost_usd(model_label, cost_basis, fallback_rate=fallback_rate)
     else:
         try:
             cost = max(float(cost_usd), 0.0)
@@ -311,9 +331,11 @@ def record_savings_event(
     event = {
         "v": SCHEMA_VERSION,
         "ts": _coerce_timestamp(timestamp).isoformat(),
+        "kind": kind,
         "before": before,
         "after": after,
         "saved": saved,
+        "tokens_retrieved": retrieved,
         "cost_usd": round(cost, 6),
         "model": model_label,
         "client": _label(client),
@@ -443,6 +465,9 @@ class _Bucket:
     #: Weakest pricing basis among the events in this bucket, so a total cannot
     #: read as better-grounded than its worst contributing event.
     basis: str | None = None
+    tokens_retrieved: int = 0
+    retrieval_cost_usd: float = 0.0
+    retrievals: int = 0
 
     def add(
         self,
@@ -465,11 +490,21 @@ class _Bucket:
         self.calls += 1
         self.basis = _weakest(self.basis, basis)
 
+    def add_retrieval(self, *, retrieved: int, cost: float) -> None:
+        self.tokens_retrieved += retrieved
+        self.retrieval_cost_usd += cost
+        self.retrievals += 1
+
     @property
     def savings_percent(self) -> float:
         if self.tokens_before <= 0:
             return 0.0
         return round(self.tokens_saved / self.tokens_before * 100, 1)
+
+    @property
+    def net_tokens_saved(self) -> int:
+        # Gross minus what retrievals re-injected. Never clamped: honest signal.
+        return self.tokens_saved - self.tokens_retrieved
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -480,6 +515,11 @@ class _Bucket:
             "basis": self.basis or BASIS_LIST,
             "calls": self.calls,
             "savings_percent": self.savings_percent,
+            "tokens_retrieved": self.tokens_retrieved,
+            "retrievals": self.retrievals,
+            "retrieval_cost_usd": round(self.retrieval_cost_usd, 6),
+            "net_tokens_saved": self.net_tokens_saved,
+            "net_cost_usd": round(self.cost_usd - self.retrieval_cost_usd, 6),
         }
 
 
@@ -567,8 +607,7 @@ def aggregate_savings(
 
     for event in events:
         ts: datetime = event["_ts"]
-        saved = max(int(event.get("saved", 0) or 0), 0)
-        before = max(int(event.get("before", 0) or 0), 0)
+        kind = str(event.get("kind") or "compress")
         try:
             cost = max(float(event.get("cost_usd", 0.0) or 0.0), 0.0)
         except (TypeError, ValueError):
@@ -598,6 +637,15 @@ def aggregate_savings(
         targets.append(by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()))
         targets.append(by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()))
 
+        if kind == "retrieve":
+            # Retrieval drawback: debit the retrieved-back tokens against net.
+            retrieved = max(int(event.get("tokens_retrieved", 0) or 0), 0)
+            for bucket in targets:
+                bucket.add_retrieval(retrieved=retrieved, cost=cost)
+            continue
+
+        saved = max(int(event.get("saved", 0) or 0), 0)
+        before = max(int(event.get("before", 0) or 0), 0)
         for bucket in targets:
             bucket.add(
                 saved=saved,

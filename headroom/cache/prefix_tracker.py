@@ -213,33 +213,6 @@ class CacheMissAttribution:
     changed_segment: str | None = None
 
 
-def segment_fingerprint(value: Any) -> str:
-    """Stable content hash for one cache-key segment (tools, system, ...).
-
-    Provider-neutral on purpose: it hashes whatever the caller hands it, so each
-    handler can pass its own request shape without this module knowing about any
-    of them.
-
-    ``cache_control`` is stripped first. Clients move the caching breakpoint from
-    turn to turn (Claude Code re-marks the newest block every call), and Headroom
-    itself re-places message markers, so the annotation flips on bytes the model
-    never sees differently. Including it would report a segment "changed" on
-    every turn and drown the real signal.
-
-    ``sort_keys`` makes the hash independent of dict ordering, so a client that
-    serializes the same tool schema with keys in a different order does not read
-    as a change.
-    """
-    canonical = json.dumps(
-        _strip_cache_control(value),
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        default=str,  # never raise on an exotic value; a stable repr is enough
-    )
-    return hashlib.md5(canonical.encode()).hexdigest()[:16]  # nosec B324
-
-
 def _strip_cache_control(obj: Any) -> Any:
     """Recursively drop ``cache_control`` for content-only equality checks.
 

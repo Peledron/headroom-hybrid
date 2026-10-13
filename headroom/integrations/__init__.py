@@ -15,7 +15,7 @@ Agno (pip install agno):
     - HeadroomPreHook/HeadroomPostHook: Agent-level hooks for tracking
     - create_headroom_hooks: Convenience function to create hook pairs
 
-CrewAI (pip install headroom[crewai]):
+CrewAI (pip install headroom-ai crewai):
     - HeadroomToolWrapper: Tool output compression for CrewAI agents
     - wrap_tools_with_headroom: Batch wrapper for CrewAI tools
 
@@ -34,7 +34,7 @@ Example:
     from headroom.integrations.langchain import HeadroomChatModel
 
     # Agno integration
-    from headroom.integrations.agno import HeadroomAgnoModel
+    from headroom.integrations import HeadroomAgnoModel
     # or explicitly:
     from headroom.integrations.agno import HeadroomAgnoModel
 

@@ -55,6 +55,9 @@ class _RawRequest:
     async def body(self):
         return self._raw
 
+    async def stream(self):
+        yield self._raw
+
 
 def _read(raw, encoding=None, *, headers=None):
     hdrs = dict(headers or {})
@@ -81,6 +84,8 @@ class _HandlerRequest:
 
 
 class _AnthropicHandler(AnthropicHandlerMixin):
+    ANTHROPIC_API_URL = "https://anthropic.example"
+
     async def _next_request_id(self) -> str:
         return "req-1"
 

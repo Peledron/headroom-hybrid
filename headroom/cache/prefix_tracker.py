@@ -26,6 +26,7 @@ import os
 import time
 from collections import OrderedDict, deque
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -102,6 +103,26 @@ _PROVIDER_CACHE_TTL_SECONDS = {
     "gemini": 300,
     "bedrock": 300,
 }
+
+# Keep tracker state through the same post-TTL confidence margin used by
+# cold-prefix detection, but never below the configured session cleanup floor.
+_CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
+
+# Recent request snapshots kept per lineage. A Claude Code fork (the subagent
+# progress summary, the parent's side query) re-sends the history plus one
+# prompt, so the next real turn extends the snapshot BEFORE the fork. A
+# request that resumes an older snapshot keeps it next-newest, so any number
+# of forks off one turn leaves that turn resumable.
+_LINEAGE_HISTORY = 3
+
+# (tracker, turn, resumed state) the current request resolved to. Each proxied
+# request runs in its own asyncio task, so it reads the state it resumed and
+# ``update_from_response`` records its response against its own turn, even
+# while a fork of the same conversation is in flight on the same tracker. Same
+# pattern as the request-scoped tenant key and CCR store.
+_resolved_turn: ContextVar[tuple[Any, int, tuple[Any, ...] | None] | None] = ContextVar(
+    "headroom_resolved_lineage_turn", default=None
+)
 
 
 @dataclass
@@ -447,6 +468,138 @@ def _classify_history_canonical(
     )
 
 
+_TRANSIENT_SYSTEM_LINEAGE_ENV = "HEADROOM_TRANSIENT_SYSTEM_LINEAGE"
+
+
+def _transient_system_lineage_enabled() -> bool:
+    return os.environ.get(_TRANSIENT_SYSTEM_LINEAGE_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _extends_past_system_tail(current_messages: list[Any], previous_messages: list[Any]) -> bool:
+    """Whether ``current`` continues ``previous`` once its trailing system turn is set aside.
+
+    Claude Code ends some requests with a ``role:"system"`` reminder and
+    replaces it on the next turn, so the recorded history is never a prefix of
+    the new one.  Only that last message is excluded: everything before it
+    must survive unchanged and include real user/assistant history, so a
+    changed leading or historical system instruction still diverges, and the
+    new history must be longer, so a sibling that only swaps the final
+    instruction is not a continuation.
+    """
+    if len(previous_messages) < 2 or len(current_messages) <= len(previous_messages):
+        return False
+    tail = previous_messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "system":
+        return False
+    stable = previous_messages[:-1]
+    return current_messages[: len(stable)] == stable and any(
+        isinstance(message, dict) and message.get("role") in ("user", "assistant")
+        for message in stable
+    )
+
+
+def _replaced_system_tail_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Cache-stable split for a request that replaced the previous trailing system turn.
+
+    The handlers record the model's reply after the request it answered, so the
+    replaced reminder is the last recorded message or sits right before that
+    reply.  It is left out of the replayed prefix (it is not in this request);
+    every other recorded message must match ``current`` position for position.
+    """
+    if not _transient_system_lineage_enabled() or len(previous_forwarded_messages) != len(
+        previous_original_messages
+    ):
+        return None
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_original_messages))
+    if len(current) != len(current_messages) or len(previous) != len(previous_original_messages):
+        # The projection dropped a directive-only message; raw indices would shift.
+        return None
+    for request_len in (len(previous), len(previous) - 1):
+        reply = previous[request_len:]
+        if reply and not (isinstance(reply[0], dict) and reply[0].get("role") == "assistant"):
+            continue
+        reminder = request_len - 1
+        if (
+            _extends_past_system_tail(current, previous[:request_len])
+            and current[reminder : reminder + len(reply)] == reply
+        ):
+            return (
+                copy.deepcopy(
+                    previous_forwarded_messages[:reminder]
+                    + previous_forwarded_messages[request_len:]
+                ),
+                copy.deepcopy(current_messages[reminder + len(reply) :]),
+            )
+    return None
+
+
+def _block_identity(block: Any) -> tuple[Any, ...]:
+    """What identifies a reply block across a client's own re-serialization."""
+    if not isinstance(block, dict):
+        return ("raw", block)
+    kind = block.get("type")
+    if kind in ("tool_use", "server_tool_use"):
+        return (kind, block.get("id"), block.get("name"))
+    return (kind,)
+
+
+def _client_rewrote_reply_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Cache-stable split when the client re-serialized the model's last reply.
+
+    The handlers record the model's raw reply as the last message of the previous
+    turn, but a client may send that reply back edited: Claude Code strips a leading
+    ``cd <cwd> &&`` from Bash commands and drops the ``caller`` annotation. Every
+    earlier message still matches, and the reply itself was model output, never part
+    of a cached prefix, so the forwarded history up to the reply is still exactly what
+    the provider cached. Replay it, take the client's version of the reply, and
+    treat what follows as the delta. Falling back to raw forwarding here instead
+    replaces every earlier compressed message with its original and re-writes the
+    whole conversation to cache.
+
+    The reply must be the same turn: an assistant message with the same block kinds
+    in the same order and the same tool_use ids.
+    """
+    n = len(previous_original_messages)
+    if n < 2 or len(previous_forwarded_messages) != n or len(current_messages) < n:
+        return None
+    prev_reply, cur_reply = previous_original_messages[-1], current_messages[n - 1]
+    if not (
+        isinstance(prev_reply, dict)
+        and isinstance(cur_reply, dict)
+        and prev_reply.get("role") == "assistant"
+        and cur_reply.get("role") == "assistant"
+    ):
+        return None
+    if _canonicalize_for_prefix_compare(
+        current_messages[: n - 1]
+    ) != _canonicalize_for_prefix_compare(previous_original_messages[: n - 1]):
+        return None
+    prev_blocks = _canonicalize_for_prefix_compare(prev_reply).get("content")
+    cur_blocks = _canonicalize_for_prefix_compare(cur_reply).get("content")
+    if not isinstance(prev_blocks, list) or not isinstance(cur_blocks, list):
+        return None
+    if [_block_identity(b) for b in prev_blocks] != [_block_identity(b) for b in cur_blocks]:
+        return None
+    return (
+        copy.deepcopy(previous_forwarded_messages[: n - 1] + [cur_reply]),
+        copy.deepcopy(current_messages[n:]),
+    )
+
+
 def classify_history_relation(
     current_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
@@ -563,10 +716,20 @@ def extract_cache_stable_delta(
     This is a COMPARISON + slice only: the returned prefix is the previously-forwarded
     bytes verbatim and the delta is the raw appended messages — never a rebuild from the
     canonical projection — so the projection dropping non-semantic fields is safe.
+
+    A previous request that ended in a ``role:"system"`` reminder the client has since
+    replaced also qualifies: its forwarded bytes are replayed without that reminder
+    (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
     relation = classify_history_relation(current_messages, previous_original_messages)
+    if relation.kind == RELATION_DIVERGED:
+        return _replaced_system_tail_delta(
+            current_messages, previous_original_messages, previous_forwarded_messages
+        ) or _client_rewrote_reply_delta(
+            current_messages, previous_original_messages, previous_forwarded_messages
+        )
     if relation.kind not in (RELATION_EXACT, RELATION_MESSAGE_APPEND):
         # A same-message block append needs a block-level splice in
         # ``overlay_cached_prefix``; slicing only whole messages would silently
@@ -577,6 +740,36 @@ def extract_cache_stable_delta(
         copy.deepcopy(previous_forwarded_messages),
         copy.deepcopy(current_messages[prefix_len:]),
     )
+
+
+def restore_frozen_prefix(
+    original_messages: list[dict[str, Any]],
+    candidate_messages: list[dict[str, Any]],
+    *,
+    frozen_message_count: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Force the frozen prefix of ``candidate_messages`` to match the original bytes.
+
+    Returns ``(restored_messages, restored_count)``. Messages a transform dropped
+    from the prefix are put back; any frozen message it changed is replaced by
+    the original. ``restored_count`` is how many prefix messages were restored.
+    """
+    if frozen_message_count <= 0 or not original_messages:
+        return candidate_messages, 0
+
+    frozen = min(frozen_message_count, len(original_messages))
+    restored = list(candidate_messages)
+
+    # Defensive: if a transform dropped prefix messages, restore them.
+    if len(restored) < frozen:
+        return list(original_messages[:frozen]) + restored, frozen
+
+    changed = 0
+    for idx in range(frozen):
+        if restored[idx] != original_messages[idx]:
+            restored[idx] = original_messages[idx]
+            changed += 1
+    return restored, changed
 
 
 def overlay_cached_prefix(
@@ -1040,7 +1233,6 @@ def _breakpoint_index(
     return relation.stable_prefix_blocks - 1
 
 
-
 def _compact_json_bytes(value: Any) -> bytes | None:
     """Return compact JSON bytes, or ``None`` when sizing cannot be proved."""
     try:
@@ -1219,7 +1411,10 @@ def normalize_message_cache_control(
             breakpoint_index = len(content) - 1
         if not isinstance(content[breakpoint_index], dict):
             return False
-        content[breakpoint_index] = {**content[breakpoint_index], "cache_control": _final_marker(marker)}
+        content[breakpoint_index] = {
+            **content[breakpoint_index],
+            "cache_control": _final_marker(marker),
+        }
         out[target_idx] = {**msg, "content": content}
         return True
 
@@ -1259,6 +1454,77 @@ def normalize_message_cache_control(
     return out if changed else messages
 
 
+def mirror_client_message_cache_control(
+    messages: list[dict[str, Any]],
+    client_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+
+    OpenAI-compatible clients that talk to Anthropic models through a gateway
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
+    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
+    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
+    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
+    ``normalize_message_cache_control`` only sees block markers
+    (``_client_marker_positions`` reads list content), so after
+    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
+    forwarded messages, these markers ride along untouched. A client that marks
+    three places per request (system, the newest tool call, the newest tool
+    result) ends up forwarding four, then five and more, and the gateway's
+    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
+    blocks with cache_control may be provided. Found 6``).
+
+    The client's current request is the authority for these markers, the same
+    rule the block-level normalizer applies: on each message and on each of its
+    ``tool_calls``, drop the marker unless the client put one there in this
+    request, in which case copy the client's own value. Content — and any
+    block-level marker in it — is left alone, so the replayed bytes the provider
+    cached stay byte-identical.
+
+    Index alignment is the invariant (the pipeline preserves message count and
+    each message's tool calls); where it does not hold, that message or list is
+    returned unchanged rather than guessing, and the breakpoint budget guard
+    still bounds the total.
+    """
+    if not isinstance(client_messages, list) or len(client_messages) != len(messages):
+        return messages
+    changed = False
+    out: list[dict[str, Any]] = []
+    for msg, client in zip(messages, client_messages):
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        new_msg, msg_changed = _mirror_marker(msg, client)
+        calls = new_msg.get("tool_calls")
+        client_calls = client.get("tool_calls") if isinstance(client, dict) else None
+        if (
+            isinstance(calls, list)
+            and isinstance(client_calls, list)
+            and len(calls) == len(client_calls)
+        ):
+            mirrored = [_mirror_marker(c, cc) for c, cc in zip(calls, client_calls)]
+            if any(c for _, c in mirrored):
+                new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
+                msg_changed = True
+        out.append(new_msg)
+        changed = changed or msg_changed
+    return out if changed else messages
+
+
+def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
+    """Give ``holder`` the client's own ``cache_control`` (or none); report change."""
+    if not isinstance(holder, dict):
+        return holder, False
+    client_marker = client_holder.get("cache_control") if isinstance(client_holder, dict) else None
+    if isinstance(client_marker, dict):
+        if holder.get("cache_control") == client_marker:
+            return holder, False
+        return {**holder, "cache_control": dict(client_marker)}, True
+    if "cache_control" in holder:
+        return {k: v for k, v in holder.items() if k != "cache_control"}, True
+    return holder, False
+
+
 class PrefixCacheTracker:
     """Tracks provider prefix cache state across turns in a session.
 
@@ -1281,6 +1547,7 @@ class PrefixCacheTracker:
     def __init__(self, provider: str, config: PrefixFreezeConfig | None = None):
         self.provider = provider
         self.config = config or PrefixFreezeConfig()
+        self._cache_ttl_seconds: int | None = None
         self._cached_token_count: int = 0
         self._cached_message_count: int = 0
         self._turn_number: int = 0
@@ -1348,6 +1615,11 @@ class PrefixCacheTracker:
         # net-cost/TTL P_alive gate could never see idle time. The handler reads
         # this and forwards it to the pipeline as `idle_seconds`.
         self._idle_seconds_at_fetch: float = 0.0
+        # Turn state after each recent request's response (None while it is in
+        # flight), keyed by the turn SessionTrackerStore issued it. A request
+        # resumes the state of the turn it extends, so a fork's response never
+        # becomes the main line's frozen prefix or replay source.
+        self._turn_states: dict[int, tuple[Any, ...] | None] = {}
 
         # Hashes of the non-message cache-key segments as last forwarded, so a
         # prefix_change can name WHICH segment moved. Segment NAMES are supplied
@@ -1449,9 +1721,7 @@ class PrefixCacheTracker:
         self._ttl_breaches = int(blob.get("ttl_breaches", 0) or 0)
         self._ttl_recommendation = blob.get("ttl_recommendation")
         self._turn_gaps = deque(blob.get("turn_gaps") or [], maxlen=8)
-        self._churn_depth_fractions = deque(
-            blob.get("churn_depth_fractions") or [], maxlen=32
-        )
+        self._churn_depth_fractions = deque(blob.get("churn_depth_fractions") or [], maxlen=32)
         self._placed_anchor_depths = list(blob.get("placed_anchor_depths") or [])
         self._compress_latched = bool(blob.get("compress_latched", False))
         kept = blob.get("last_compression_kept")
@@ -1461,9 +1731,7 @@ class PrefixCacheTracker:
         self._kept_var = float(blob.get("kept_var", 0.0) or 0.0)
         self._busts_avoided = int(blob.get("busts_avoided", 0) or 0)
         self._tokens_preserved = int(blob.get("tokens_preserved", 0) or 0)
-        self._compression_foregone_tokens = int(
-            blob.get("compression_foregone_tokens", 0) or 0
-        )
+        self._compression_foregone_tokens = int(blob.get("compression_foregone_tokens", 0) or 0)
         hybrid = blob.get("hybrid")
         if isinstance(hybrid, dict):
             self.hybrid_controller.restore_state(hybrid)
@@ -1477,13 +1745,14 @@ class PrefixCacheTracker:
 
         Returns 0 on turn 0 (cold start) or if caching is disabled/below threshold.
         """
+        turn_number, cached_tokens, cached_messages, _, _ = self._request_turn_state()
         if not self.config.enabled:
             return 0
-        if self._turn_number == 0:
+        if turn_number == 0:
             return 0
-        if self._cached_token_count < self.config.min_cached_tokens:
+        if cached_tokens < self.config.min_cached_tokens:
             return 0
-        return self._cached_message_count
+        return int(cached_messages)
 
     def record_turn_gap(self, gap_seconds: float | None) -> None:
         """Record the observed gap since this session's previous request.
@@ -1568,9 +1837,7 @@ class PrefixCacheTracker:
         steady_write = self._steady_write_tokens
         if prefix_tokens < _TTL_SIZE_FLOOR_TOKENS or not steady_write:
             return False
-        breakeven_turns = (_TTL_5M_WRITE_PENALTY * prefix_tokens) / (
-            _TTL_1H_PREMIUM * steady_write
-        )
+        breakeven_turns = (_TTL_5M_WRITE_PENALTY * prefix_tokens) / (_TTL_1H_PREMIUM * steady_write)
         # Observed turns per breach, with the whole session as the sample. No
         # breach yet means no evidence for the premium, so 5m holds.
         if self._ttl_breaches <= 0:
@@ -1677,9 +1944,7 @@ class PrefixCacheTracker:
         """
         self._placed_anchor_depths = []
 
-    def survival_p_alive(
-        self, ttl_seconds: float, linear_fallback: float
-    ) -> float:
+    def survival_p_alive(self, ttl_seconds: float, linear_fallback: float) -> float:
         """P(the prefix written now is read again before its TTL lapses).
 
         Empirical hazard estimate from this session's observed inter-turn gaps:
@@ -1701,9 +1966,7 @@ class PrefixCacheTracker:
         blended = weight * empirical + (1.0 - weight) * linear_fallback
         return min(max(blended, 0.0), 1.0)
 
-    def expected_reads_within_ttl(
-        self, ttl_seconds: float, fallback: float
-    ) -> float:
+    def expected_reads_within_ttl(self, ttl_seconds: float, fallback: float) -> float:
         """Forecast of future same-session reads before a TTL-lapsing gap.
 
         The net-mutation break-even amortizes a bust over expected future
@@ -1915,6 +2178,7 @@ class PrefixCacheTracker:
         if total_cached == 0:
             self._cached_token_count = 0
             self._cached_message_count = 0
+            self._record_turn_state()
             return
 
         # Estimate per-message token counts if not provided
@@ -1934,6 +2198,7 @@ class PrefixCacheTracker:
 
         self._cached_token_count = total_cached
         self._cached_message_count = frozen_count
+        self._record_turn_state()
 
         logger.debug(
             "PrefixCacheTracker[%s]: turn=%d, cached=%d tokens, "
@@ -1948,12 +2213,56 @@ class PrefixCacheTracker:
         )
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
-        """Returns internal state — treat as immutable; do not mutate messages or blocks."""
-        return self._last_original_messages
+        return copy.deepcopy(self._request_turn_state()[3])
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
-        """Returns internal state — treat as immutable; do not mutate messages or blocks."""
-        return self._last_forwarded_messages
+        return copy.deepcopy(self._request_turn_state()[4])
+
+    def _turn_state(self) -> tuple[Any, ...]:
+        return (
+            self._turn_number,
+            self._cached_token_count,
+            self._cached_message_count,
+            self._last_original_messages,
+            self._last_forwarded_messages,
+        )
+
+    def _request_turn_state(self) -> tuple[Any, ...]:
+        """The state this request resumed at resolve time, else the current one.
+
+        A handler may read after an ``await`` (OpenAI's overlay runs after
+        compression), by which time a sibling request on this lineage may have
+        resumed a different turn.
+        """
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self and resolved[2] is not None:
+            return resolved[2]
+        return self._turn_state()
+
+    def _record_turn_state(self) -> None:
+        """Remember this response's state under the turn that sent it."""
+        resolved = _resolved_turn.get()
+        if resolved is not None and resolved[0] is self:
+            if resolved[1] in self._turn_states:
+                self._turn_states[resolved[1]] = self._turn_state()
+            # The request has its response; later reads see the current state.
+            _resolved_turn.set((self, resolved[1], None))
+
+    def _resume_turn(self, turn: int | None) -> None:
+        """Continue from ``turn``'s response, not whichever response came last.
+
+        A turn still in flight (or one recorded before turn tracking) has no
+        state yet; the current state stands, as it did before.
+        """
+        state = self._turn_states.get(turn) if turn is not None else None
+        if state is not None:
+            (
+                self._turn_number,
+                self._cached_token_count,
+                self._cached_message_count,
+                self._last_original_messages,
+                self._last_forwarded_messages,
+            ) = state
 
     def record_returned(
         self,
@@ -2036,9 +2345,8 @@ class PrefixCacheTracker:
         if idle_seconds is None:
             idle_seconds = self.seconds_since_activity()
         ttl = self.resolved_cache_ttl_seconds()
-        expected = self._cached_token_count
-        # Always roll the segment hashes forward, hit or miss, so the next turn
-        # compares against what we actually forwarded this turn.
+        # The turn this request resumed, not whichever sibling answered last.
+        expected = self._request_turn_state()[1]
         changed_segment = self._diff_segments(segments)
 
         # Nothing was cached last turn → cold start, not a miss.
@@ -2142,7 +2450,7 @@ class PrefixCacheTracker:
         content. Anything else (a frozen message rewritten, the prefix
         reordered, the list now shorter) counts as a prefix change.
         """
-        prev = self._last_forwarded_messages
+        prev: list[dict[str, Any]] = self._request_turn_state()[4]
         if not prev:
             # No recorded prefix to compare — can't claim it changed.
             return True
@@ -2244,18 +2552,34 @@ class PrefixCacheTracker:
 
     @property
     def is_expired(self) -> bool:
-        """Check if this tracker has been idle beyond TTL."""
-        return (time.time() - self._last_activity) > self.config.session_ttl_seconds
+        """Check if this tracker has been idle beyond its effective retention."""
+        return self.is_expired_for_cache_ttl(None)
+
+    def is_expired_for_cache_ttl(self, cache_ttl_seconds: int | None) -> bool:
+        """Check expiry including the longest configured or observed cache lifetime."""
+        observed_ttl = max(
+            self._cache_ttl_seconds or 0,
+            self.config.cache_ttl_seconds or 0,
+            cache_ttl_seconds or 0,
+        )
+        retention = max(
+            self.config.session_ttl_seconds,
+            observed_ttl + _CACHE_TTL_CLEANUP_MARGIN_SECONDS if observed_ttl else 0,
+        )
+        return (time.time() - self._last_activity) > retention
+
+    def observe_cache_ttl(self, cache_ttl_seconds: int | None) -> None:
+        """Remember the longest provider cache lifetime observed for this lineage."""
+        if cache_ttl_seconds is not None:
+            self._cache_ttl_seconds = max(self._cache_ttl_seconds or 0, cache_ttl_seconds)
 
     def seconds_since_activity(self) -> float:
         """Wall-clock seconds since this tracker last saw activity.
 
         #856 P3b feeds this to the net-cost gate as an idle signal: as it
-        approaches the provider's prompt-cache TTL (~300s for Anthropic),
-        P_alive decays toward 0 and deep edits near cache lapse become free.
-        Distinct from :attr:`is_expired`, which uses the much longer
-        session-tracker *cleanup* TTL (``session_ttl_seconds``), not the cache
-        TTL.
+        approaches the provider's prompt-cache TTL, P_alive decays toward 0.
+        Unlike provider cache freshness, tracker cleanup uses the configured
+        session floor or the observed cache lifetime plus its cleanup margin.
 
         Wiring caveat: ``SessionTrackerStore.get_or_create`` refreshes
         ``_last_activity`` on access, so a caller that wants the idle gap
@@ -2415,6 +2739,10 @@ class SessionTrackerStore:
         # but different tool profiles must never share frozen-prefix state.
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+        # Recent (snapshot, turn) per tracker key, newest first; the newest
+        # snapshot is the one in ``_lineages``.
+        self._lineage_history: dict[str, deque[tuple[list[Any], int]]] = {}
+        self._turn_counter = itertools.count(1)
 
     def peek(self, session_id: str) -> PrefixCacheTracker | None:
         """Return the live tracker for ``session_id``, else None.
@@ -2436,21 +2764,28 @@ class SessionTrackerStore:
             return None
         return tracker
 
-    def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
+    def get_or_create(
+        self, session_id: str, provider: str, cache_ttl_seconds: int | None = None
+    ) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
+        tracker = self._trackers.get(session_id)
+        if tracker is not None and tracker.is_expired:
+            self._discard_tracker(session_id)
+            tracker = None
+        if tracker is not None:
+            # Extend retention before the request-time cleanup sweep.
+            tracker.observe_cache_ttl(cache_ttl_seconds)
         self._maybe_cleanup()
 
-        if session_id in self._trackers:
-            tracker = self._trackers[session_id]
-            # Snapshot idle-since-last-response BEFORE bumping the access clock,
-            # so the net-cost/TTL gate sees the true gap (see the attribute's
-            # docstring in PrefixCacheTracker.__init__).
+        if tracker is not None and session_id in self._trackers:
+            # Snapshot idle-since-last-response BEFORE bumping the access clock.
             tracker._idle_seconds_at_fetch = max(0.0, time.time() - tracker._last_activity)
             tracker._last_activity = time.time()
             return tracker
 
         tracker = PrefixCacheTracker(provider, self._default_config)
-        tracker._idle_seconds_at_fetch = 0.0  # cold start: nothing cached to lapse
+        tracker.observe_cache_ttl(cache_ttl_seconds)
+        tracker._idle_seconds_at_fetch = 0.0
         self._trackers[session_id] = tracker
         return tracker
 
@@ -2515,12 +2850,23 @@ class SessionTrackerStore:
             )
         return best_key
 
+    def _discard_tracker(self, tracker_key: str) -> None:
+        """Remove a tracker and any lineage indexes that point to it."""
+        self._trackers.pop(tracker_key, None)
+        self._lineage_history.pop(tracker_key, None)
+        for session_id, family in list(self._lineages.items()):
+            family.pop(tracker_key, None)
+            self._lineage_affinities.pop(tracker_key, None)
+            if not family:
+                del self._lineages[session_id]
+
     def resolve_tracker(
         self,
         session_id: str,
         provider: str,
         messages: list[dict[str, Any]] | None = None,
         cache_affinity: str | None = None,
+        cache_ttl_seconds: int | None = None,
     ) -> PrefixCacheTracker:
         """Resolve the tracker for THIS conversation within a session id (#2085).
 
@@ -2537,7 +2883,10 @@ class SessionTrackerStore:
         where a large leading run and two-block identity suffix survive while
         the middle tail is regenerated; all other rewrites start a fresh
         lineage. This keeps #2671's stable cache boundary attached without
-        merging unrelated parallel sub-calls.
+        merging unrelated parallel sub-calls. When nothing else matches, an
+        Anthropic chain whose trailing ``role:"system"`` reminder the client
+        replaced is matched on the history before that reminder
+        (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
         Byte-identical histories (templated fan-outs before they diverge)
         intentionally share a tracker: their provider cache line is identical
         too, so sharing is harmless.
@@ -2559,20 +2908,19 @@ class SessionTrackerStore:
             cache_affinity: Stable fingerprint of the provider's non-message
                 cache-key segments (model/tools/tool choice/thinking). Lineages
                 with different affinity never share a tracker.
+            cache_ttl_seconds: Resolved provider cache lifetime for this
+                request. It extends this lineage's cleanup retention before
+                the periodic sweep.
 
         Returns:
             The ``PrefixCacheTracker`` for this conversation's lineage.
         """
         if not messages or not self._default_config.enabled:
-            # No lineage signal, or prefix freeze is disabled (there is no
-            # frozen state to protect): legacy one-tracker-per-session-id.
-            return self.get_or_create(session_id, provider)
+            # No lineage signal, or freeze disabled: use the session tracker.
+            return self.get_or_create(session_id, provider, cache_ttl_seconds)
 
-        # Prune expired trackers BEFORE matching, so a dead lineage cannot win
-        # the match. This also arms the cleanup interval: the get_or_create
-        # calls below cannot re-trigger a prune mid-function, so the family
-        # read here stays attached through the stamp at the end.
-        self._maybe_cleanup()
+        # Defer the sweep until the request has matched its lineage, allowing
+        # that tracker to record the provider TTL before cleanup evaluates it.
 
         # The repo's canonical cross-turn equivalence, shared with the
         # cache-stable delta path: a moved cache breakpoint, string<->block
@@ -2584,7 +2932,7 @@ class SessionTrackerStore:
         if not canon:
             # Degenerate: every message projected away (pure directive
             # content) — no lineage signal to match on.
-            return self.get_or_create(session_id, provider)
+            return self.get_or_create(session_id, provider, cache_ttl_seconds)
         snap = _lineage_snapshot(canon)
 
         family = self._lineages.setdefault(session_id, OrderedDict())
@@ -2593,21 +2941,54 @@ class SessionTrackerStore:
         # Rewritten-tail matches are deliberately last and require a unique best
         # structural score; ambiguity starts a fresh lineage instead of making
         # sibling sub-calls ping-pong one tracker.
+        expired_keys = [
+            key for key in family if key not in self._trackers or self._trackers[key].is_expired
+        ]
+        for key in expired_keys:
+            family.pop(key, None)
+            self._lineage_affinities.pop(key, None)
+            self._lineage_history.pop(key, None)
+            self._trackers.pop(key, None)
         by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
-        best_key: str | None = None
-        for accepted in (
-            (RELATION_EXACT, RELATION_MESSAGE_APPEND),
-            (RELATION_BLOCK_APPEND,),
-        ):
-            for key, chain in by_length:
-                if self._lineage_affinities.get(key) != cache_affinity:
-                    continue
-                relation = _classify_history_canonical(snap, chain)
-                if relation.kind in accepted:
-                    best_key = key
-                    break
-            if best_key is not None:
-                break
+
+        def continuation(
+            candidates: list[tuple[str, list[Any], int | None]],
+        ) -> tuple[str | None, int | None]:
+            for accepted in (
+                (RELATION_EXACT, RELATION_MESSAGE_APPEND),
+                (RELATION_BLOCK_APPEND,),
+            ):
+                for key, chain, turn in candidates:
+                    if self._lineage_affinities.get(key) != cache_affinity:
+                        continue
+                    if _classify_history_canonical(snap, chain).kind in accepted:
+                        return key, turn
+            return None, None
+
+        def latest_turn(key: str) -> int | None:
+            history = self._lineage_history.get(key)
+            return history[0][1] if history else None
+
+        best_key, best_turn = continuation(
+            [(key, chain, latest_turn(key)) for key, chain in by_length]
+        )
+        if best_key is None:
+            # A fork (Claude Code's subagent summary or side query: the
+            # history plus one prompt) became a lineage's latest snapshot, so
+            # this turn extends the snapshot before it. Resume that turn
+            # instead of starting a cold lineage that recompresses history the
+            # provider already cached.
+            best_key, best_turn = continuation(
+                sorted(
+                    (
+                        (key, chain, turn)
+                        for key in family
+                        for chain, turn in list(self._lineage_history.get(key, ()))[1:]
+                    ),
+                    key=lambda item: len(item[1]),
+                    reverse=True,
+                )
+            )
 
         if best_key is None:
             rewrite_candidates: list[tuple[tuple[int, int, int], str]] = []
@@ -2631,6 +3012,28 @@ class SessionTrackerStore:
                 len(rewrite_candidates) == 1 or rewrite_candidates[0][0] != rewrite_candidates[1][0]
             ):
                 best_key = rewrite_candidates[0][1]
+            elif (
+                not rewrite_candidates
+                and provider == "anthropic"
+                and _transient_system_lineage_enabled()
+            ):
+                # Nothing matched as recorded.  A chain whose only change is
+                # its replaced trailing system reminder is still this
+                # conversation; without it every such turn starts a cold
+                # tracker, the confirmed prefix is not replayed, and any
+                # recompressed history re-writes the provider cache.  Only a
+                # unique longest chain qualifies, so equal-length siblings
+                # that differ in their reminder stay separate.
+                tail_candidates = [
+                    (len(chain), key)
+                    for key, chain in by_length
+                    if self._lineage_affinities.get(key) == cache_affinity
+                    and _extends_past_system_tail(snap, chain)
+                ]
+                if tail_candidates and (
+                    len(tail_candidates) == 1 or tail_candidates[0][0] != tail_candidates[1][0]
+                ):
+                    best_key = tail_candidates[0][1]
 
         if best_key is None:
             # No chain prefixes the incoming history at MESSAGE granularity, but
@@ -2645,9 +3048,7 @@ class SessionTrackerStore:
             # place. A history that both gained a message and rewrote an older
             # one did not grow in place and starts a fresh lineage. Longest
             # chain first, so an exact continuation is never displaced.
-            for key, chain in sorted(
-                family.items(), key=lambda kv: len(kv[1]), reverse=True
-            ):
+            for key, chain in sorted(family.items(), key=lambda kv: len(kv[1]), reverse=True):
                 if len(chain) != len(snap) or not chain:
                     continue
                 head = len(chain) - 1
@@ -2694,7 +3095,7 @@ class SessionTrackerStore:
                         cap,
                         session_id,
                     )
-                return self.get_or_create(overflow_key, provider)
+                return self.get_or_create(overflow_key, provider, cache_ttl_seconds)
             if not family:
                 # First lineage rides the bare session id; this also adopts a
                 # tracker created earlier via plain get_or_create.
@@ -2702,13 +3103,31 @@ class SessionTrackerStore:
             else:
                 best_key = f"{session_id}\x00{next(self._lineage_counter)}"
 
-        # get_or_create (not a private fetch) so test stubs that patch the
-        # instance method keep intercepting tracker creation; its internal
-        # cleanup is interval-gated and was armed above, so it cannot prune
-        # the family before the stamp below.
-        tracker = self.get_or_create(best_key, provider)
+        # Fetch through the public method so test stubs can intercept tracker
+        # creation. The selected lineage's TTL is applied before its cleanup
+        # sweep, then its snapshot is stamped after the family has been pruned.
+        tracker = self.get_or_create(best_key, provider, cache_ttl_seconds)
+        # Lookup can evict an expired bare tracker and detach an empty family.
+        # Stamp the replacement into the live index, not that detached mapping.
+        family = self._lineages.setdefault(session_id, family)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
+        if isinstance(tracker, PrefixCacheTracker):  # test stubs keep no turns
+            tracker._resume_turn(best_turn if best_turn is not None else latest_turn(best_key))
+            turn = next(self._turn_counter)
+            history = self._lineage_history.setdefault(best_key, deque(maxlen=_LINEAGE_HISTORY))
+            branch = next((entry for entry in history if entry[1] == best_turn), None)
+            if branch is not None and branch is not history[0]:
+                # A fork off an older turn: that turn stays the branch point the
+                # next main turn extends, so keep it behind this request rather
+                # than let successive forks push it out.
+                history.remove(branch)
+                history.appendleft(branch)
+            history.appendleft((snap, turn))
+            live = {t for _, t in history}
+            tracker._turn_states = {t: s for t, s in tracker._turn_states.items() if t in live}
+            tracker._turn_states[turn] = None
+            _resolved_turn.set((tracker, turn, tracker._turn_state()))
         return tracker
 
     _OVERFLOW_SUFFIX = "\x00overflow"
@@ -2758,9 +3177,7 @@ class SessionTrackerStore:
             return 0
 
         raw_lineages = blob.get("lineages")
-        saved_lineages: dict[str, Any] = (
-            raw_lineages if isinstance(raw_lineages, dict) else {}
-        )
+        saved_lineages: dict[str, Any] = raw_lineages if isinstance(raw_lineages, dict) else {}
 
         restored = 0
         highest_lineage = 0
@@ -2908,6 +3325,7 @@ class SessionTrackerStore:
                 for key in [k for k in family if k not in self._trackers]:
                     del family[key]
                     self._lineage_affinities.pop(key, None)
+                    self._lineage_history.pop(key, None)
                 if not family:
                     del self._lineages[base]
             logger.debug("SessionTrackerStore: cleaned up %d expired sessions", len(expired))
@@ -2918,5 +3336,3 @@ class SessionTrackerStore:
     def active_sessions(self) -> int:
         """Number of active session trackers (one per conversation lineage)."""
         return len(self._trackers)
-
-

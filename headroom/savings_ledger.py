@@ -287,6 +287,8 @@ def record_savings_event(
     provider: Any = None,
     kind: str = "compress",
     tokens_retrieved: int = 0,
+    new_input_tokens: int | None = None,
+    deferred_tokens: int = 0,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -297,9 +299,27 @@ def record_savings_event(
     proxy path does; the MCP path does not), both are recorded and the event
     also carries a cache-aware ``cost_effective_usd``. ``cost_usd`` keeps its
     original list-priced meaning either way, so existing readers are unaffected.
+    ``new_input_tokens`` is the provider-billed input that newly entered
+    context this request (uncached + cache-write), the denominator /stats
+    reports as ``new_input_savings_percent``. ``deferred_tokens`` is the part
+    of ``saved`` that is tool-schema deferral, which rides the cached prefix
+    and is never part of new input; it is subtracted from the numerator so the
+    ledger pairs compression-only savings with new input exactly as /stats
+    does. Both are optional so MCP-tool events and older callers keep writing
+    the same line they always did.
+
+    A request that saved nothing but carries ``new_input_tokens`` is still
+    written, as a denominator-only observation: the new-input basis must see
+    every request that newly billed input, not only the ones compression
+    touched, or a 100-saved/100-new turn followed by a 0-saved/10,000-new turn
+    reads as 50 percent instead of under 1. Without ``new_input_tokens`` a
+    zero-saving request is skipped exactly as before.
     """
 
     kind = str(kind or "compress")
+    if _paths.process_is_stateless():
+        return False
+
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)
@@ -313,7 +333,7 @@ def record_savings_event(
         # retrieved-back token volume so aggregate_savings can debit net.
         if retrieved <= 0:
             return False
-    elif saved <= 0:
+    elif saved <= 0 and new_input_tokens is None:
         return False
 
     model_label = _normalize_model(model)
@@ -342,6 +362,13 @@ def record_savings_event(
         "source": str(source or UNKNOWN),
         "pid": os.getpid(),
     }
+    if new_input_tokens is not None:
+        try:
+            event["new_input"] = max(int(new_input_tokens), 0)
+            event["deferred"] = min(max(int(deferred_tokens), 0), saved)
+        except (TypeError, ValueError):
+            event.pop("new_input", None)
+            event.pop("deferred", None)
 
     # The savings split. Recorded only when the caller actually knows it —
     # absent means "one undifferentiated figure", which is what every v1 event
@@ -393,6 +420,8 @@ def record_savings_event(
             if cost_usd is None:
                 event["cost_usd"] = round(list_usd, 6)
 
+    if not _paths.persistence_allowed("savings ledger"):
+        return False
     target = _resolve_path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -468,6 +497,10 @@ class _Bucket:
     tokens_retrieved: int = 0
     retrieval_cost_usd: float = 0.0
     retrievals: int = 0
+    # Only events that recorded new input contribute to BOTH of these, so the
+    # ratio never pairs one event's savings with another event's denominator.
+    new_input_tokens: int = 0
+    new_input_saved: int = 0
 
     def add(
         self,
@@ -477,7 +510,15 @@ class _Bucket:
         cost: float,
         cost_effective: float | None = None,
         basis: str | None = None,
+        new_input: int | None = None,
+        deferred: int = 0,
     ) -> None:
+        if saved <= 0 and new_input is not None:
+            # Denominator-only observation (see record_savings_event): it
+            # belongs in the new-input basis and nowhere else, so calls,
+            # before/saved and cost keep their saved-event semantics.
+            self.new_input_tokens += new_input
+            return
         self.tokens_saved += saved
         self.tokens_before += before
         self.cost_usd += cost
@@ -489,6 +530,9 @@ class _Bucket:
         self.cost_effective_usd += cost if cost_effective is None else cost_effective
         self.calls += 1
         self.basis = _weakest(self.basis, basis)
+        if new_input is not None:
+            self.new_input_tokens += new_input
+            self.new_input_saved += max(saved - deferred, 0)
 
     def add_retrieval(self, *, retrieved: int, cost: float) -> None:
         self.tokens_retrieved += retrieved
@@ -506,6 +550,20 @@ class _Bucket:
         # Gross minus what retrievals re-injected. Never clamped: honest signal.
         return self.tokens_saved - self.tokens_retrieved
 
+    @property
+    def new_input_savings_percent(self) -> float:
+        """Compression-only savings as a share of what newly entered context.
+
+        The whole-wire ratio above recounts a session's cached history every
+        turn, so long sessions read as ~0% no matter how well compression does
+        on new content. Same definition as /stats ``new_input_savings_percent``:
+        saved / (new input + saved), since removed tokens never reached the
+        provider and are added back to form the baseline.
+        """
+        if self.new_input_tokens <= 0:
+            return 0.0
+        return round(self.new_input_saved / (self.new_input_tokens + self.new_input_saved) * 100, 1)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "tokens_saved": self.tokens_saved,
@@ -520,6 +578,8 @@ class _Bucket:
             "retrieval_cost_usd": round(self.retrieval_cost_usd, 6),
             "net_tokens_saved": self.net_tokens_saved,
             "net_cost_usd": round(self.cost_usd - self.retrieval_cost_usd, 6),
+            "new_input_tokens": self.new_input_tokens,
+            "new_input_savings_percent": self.new_input_savings_percent,
         }
 
 
@@ -629,6 +689,15 @@ def aggregate_savings(
         # built from them widens to a union that no longer type-checks against
         # `add`'s signature. Listed out per bucket rather than via a local
         # helper, which would close over these loop variables.
+        new_input: int | None = None
+        deferred = 0
+        if event.get("new_input") is not None:
+            try:
+                new_input = max(int(event.get("new_input") or 0), 0)
+                deferred = max(int(event.get("deferred", 0) or 0), 0)
+            except (TypeError, ValueError):
+                new_input = None
+
         targets = [windowed]
         if ts >= today_cutoff:
             targets.append(today)
@@ -653,6 +722,8 @@ def aggregate_savings(
                 cost=cost,
                 cost_effective=effective,
                 basis=basis,
+                new_input=new_input,
+                deferred=deferred,
             )
 
     model_rows = _ranked(by_model, "model")

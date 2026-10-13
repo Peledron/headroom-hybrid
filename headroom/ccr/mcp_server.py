@@ -31,7 +31,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
@@ -40,6 +40,9 @@ from headroom.cache.compression_store import (
     format_retrieval_miss_detail,
 )
 from headroom.telemetry import session as telemetry_session
+
+if TYPE_CHECKING:
+    from headroom.tokenizers.estimator import EstimatingTokenCounter
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -91,6 +94,57 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 )
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
+
+
+def _proxy_auth_headers() -> dict[str, str] | None:
+    """Proxy credential for a token-gated remote proxy's ``/stats``.
+
+    Sent as ``x-headroom-proxy-token``, never ``Authorization``, matching what
+    the proxy's gate reads first. Read per client so the env set by the MCP
+    host at launch applies; ``None`` keeps loopback proxies header-free.
+
+    The token does not open ``/v1/retrieve`` to a remote caller: the proxy
+    serves retrieval to loopback peers only and answers 404 to anyone else.
+    """
+    token = os.environ.get("HEADROOM_PROXY_TOKEN", "").strip()
+    return {"x-headroom-proxy-token": token} if token else None
+
+
+_PROXY_RETRIEVAL_LOOPBACK_ONLY = "proxy_retrieval_loopback_only"
+
+
+def _is_hidden_route_404(response: Any) -> bool:
+    """True for the loopback guard's bare 404, not a store miss.
+
+    A miss carries the store's reason ("Entry not found ...", "Entry expired
+    ..."); the guard answers FastAPI's default ``Not Found`` so the route looks
+    absent. The proxy URL can't tell them apart: a reverse proxy or
+    port-forward may reach the proxy over loopback behind a public URL.
+    """
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return False
+    return bool(detail == "Not Found")
+
+
+def _proxy_retrieval_loopback_only_payload(proxy_url: str, hash_key: str) -> dict[str, Any]:
+    """The proxy hid /v1/retrieve from this caller, which only loopback peers may use."""
+    return {
+        "error": (
+            f"The proxy at {proxy_url} did not serve /v1/retrieve to this caller. It "
+            "serves retrieval to loopback callers only and answers 404 to any other "
+            "caller, with or without HEADROOM_PROXY_TOKEN."
+        ),
+        "hash": hash_key,
+        "status": _PROXY_RETRIEVAL_LOOPBACK_ONLY,
+        "hint": (
+            "Run the MCP server on the proxy's host, or reach the proxy over loopback "
+            "(a port-forward or a sidecar). Otherwise re-run the command or re-read "
+            "the file that produced the compressed content."
+        ),
+    }
+
 
 # How often the parent-death watchdog polls os.getppid() (seconds). When the
 # launching MCP client is SIGKILLed, stdin EOF may never arrive and the SDK's
@@ -211,7 +265,13 @@ SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
-    """Append an event to the shared stats file (cross-process, file-locked)."""
+    """Append an event to the shared stats file (cross-process, file-locked).
+
+    No-op in stateless mode (``HEADROOM_STATELESS``): the aggregate then covers
+    only this process, which is the documented stateless trade-off.
+    """
+    if not _paths.persistence_allowed("MCP session stats"):
+        return
     try:
         SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
@@ -251,8 +311,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     keep_lines.append(line + "\n")
             except json.JSONDecodeError:
                 continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
+        # Prune old entries (only if we dropped some). Never rewrite the file in
+        # stateless mode — reading is fine, writing is not.
+        if len(keep_lines) < len(lines) and _paths.persistence_allowed("MCP session stats"):
             try:
                 with open(SHARED_STATS_FILE, "w") as f:
                     if _HAS_FCNTL:
@@ -397,7 +458,7 @@ class HeadroomMCPServer:
         self._http_client: httpx.AsyncClient | None = None  # type: ignore[assignment]
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
-        self._compressor_initialized = False
+        self._token_estimator: EstimatingTokenCounter | None = None
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 
@@ -420,6 +481,23 @@ class HeadroomMCPServer:
 
             self._local_store = get_compression_store()
         return self._local_store
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Price file content in tokens, the way the rest of the pipeline does.
+
+        Whitespace splitting is a word count, not a token count. Measured on
+        real files it under-reports by 1.43x on prose, 1.30x on source, and
+        691x for the 2.2 KB single-line JSON array in the regression test -- a
+        compact document has no spaces, so the whole file is one "word". That
+        figure is stored as ``original_tokens`` (which the savings totals sum
+        over) and echoed back to the agent as ``~N tokens`` in the
+        already-in-context note it uses to decide whether to re-read the file.
+        """
+        if self._token_estimator is None:
+            from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+            self._token_estimator = EstimatingTokenCounter()
+        return max(1, self._token_estimator.count_text(text))
 
     def _compress_content(self, content: str) -> dict[str, Any]:
         """Compress content using Headroom's pipeline.
@@ -519,6 +597,7 @@ class HeadroomMCPServer:
                     }
 
         # Fall back to proxy if available
+        proxy_miss: dict[str, Any] | None = None
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
                 result = await self._retrieve_via_proxy(hash_key)
@@ -531,6 +610,7 @@ class HeadroomMCPServer:
                     self._stats.record_retrieval(hash_key, retrieved_tokens)
                     self._record_retrieval_savings(retrieved_tokens)
                     return result
+                proxy_miss = result
             except Exception:
                 pass  # Proxy unavailable, that's fine
 
@@ -554,6 +634,9 @@ class HeadroomMCPServer:
                 ),
             }
 
+        if proxy_miss is not None and proxy_miss.get("status") == _PROXY_RETRIEVAL_LOOPBACK_ONLY:
+            return proxy_miss
+
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
             "hash": hash_key,
@@ -570,7 +653,7 @@ class HeadroomMCPServer:
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=15.0)
+            self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
@@ -578,6 +661,8 @@ class HeadroomMCPServer:
         response = await self._http_client.post(url, json=payload)
 
         if response.status_code == 404:
+            if _is_hidden_route_404(response):
+                return _proxy_retrieval_loopback_only_payload(self.proxy_url, hash_key)
             return {"error": "Not found in proxy store", "hash": hash_key}
 
         response.raise_for_status()
@@ -977,7 +1062,7 @@ class HeadroomMCPServer:
         """Fetch full stats from the proxy (includes summary)."""
         try:
             if self._http_client is None:
-                self._http_client = httpx.AsyncClient(timeout=15.0)
+                self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
             response = await self._http_client.get(f"{self.proxy_url}/stats")
             if response.status_code != 200:
                 return None
@@ -1094,16 +1179,16 @@ class HeadroomMCPServer:
 
         # Fresh read: store in CCR and cache the hash
         store = self._get_local_store()
+        token_estimate = self._estimate_tokens(content)
         ccr_hash = store.store(
             original=content,
             compressed=f"[File: {path.name}, {line_count} lines]",
-            original_tokens=len(content.split()),
+            original_tokens=token_estimate,
             compressed_tokens=5,
             tool_name="headroom_read",
             ttl=MCP_SESSION_TTL,
         )
 
-        token_estimate = len(content.split())
         self._file_cache[str_path] = (content_hash, ccr_hash, line_count, token_estimate)
 
         # Return full content with line numbers (like Claude Code's Read tool)

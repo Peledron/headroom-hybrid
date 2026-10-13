@@ -17,19 +17,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from headroom.proxy.helpers import (
-    RequestBodyTooLarge,
-    get_body_too_large_status,
-)
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.batch import BatchHandlerMixin
 from headroom.proxy.handlers.bedrock import BedrockHandlerMixin
 from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
-
-_TOO_LARGE = RequestBodyTooLarge(
-    "gzip request body exceeds the 100-byte decompression limit"
+from headroom.proxy.helpers import (
+    RequestBodyTooLarge,
+    get_body_too_large_status,
 )
+
+_TOO_LARGE = RequestBodyTooLarge("gzip request body exceeds the 100-byte decompression limit")
 
 
 class _FakeState:
@@ -108,6 +106,9 @@ class _BatchHandler(BatchHandlerMixin):
     async def _next_request_id(self) -> str:
         return "req-1"
 
+    async def _record_request_outcome(self, outcome):
+        self.outcome = outcome
+
 
 class _GeminiHandler(GeminiHandlerMixin):
     async def _next_request_id(self) -> str:
@@ -122,9 +123,7 @@ class _GeminiHandler(GeminiHandlerMixin):
 @pytest.mark.asyncio
 async def test_openai_chat_bomb_returns_body_too_large_status(monkeypatch) -> None:
     monkeypatch.setattr("headroom.proxy.helpers._read_request_json", _raise_too_large)
-    response = await _OpenAIHandler().handle_openai_chat(
-        _FakeRequest(path="/v1/chat/completions")
-    )
+    response = await _OpenAIHandler().handle_openai_chat(_FakeRequest(path="/v1/chat/completions"))
     assert response.status_code == get_body_too_large_status()
     error = _error_payload(response)["error"]
     assert error["code"] == "request_too_large"
@@ -133,12 +132,8 @@ async def test_openai_chat_bomb_returns_body_too_large_status(monkeypatch) -> No
 
 @pytest.mark.asyncio
 async def test_openai_responses_bomb_returns_body_too_large_status(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large
-    )
-    response = await _OpenAIHandler().handle_openai_responses(
-        _FakeRequest(path="/v1/responses")
-    )
+    monkeypatch.setattr("headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large)
+    response = await _OpenAIHandler().handle_openai_responses(_FakeRequest(path="/v1/responses"))
     assert response.status_code == get_body_too_large_status()
     assert _error_payload(response)["error"]["code"] == "request_too_large"
 
@@ -161,12 +156,8 @@ async def test_anthropic_messages_bomb_returns_body_too_large_status(monkeypatch
     async def _noop(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
         return None
 
-    monkeypatch.setattr(
-        "headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large
-    )
-    monkeypatch.setattr(
-        "headroom.proxy.handlers.anthropic.emit_stage_timings_log", _noop
-    )
+    monkeypatch.setattr("headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large)
+    monkeypatch.setattr("headroom.proxy.handlers.anthropic.emit_stage_timings_log", _noop)
     response = await _AnthropicHandler().handle_anthropic_messages(
         _FakeRequest(path="/v1/messages")
     )
@@ -181,9 +172,7 @@ async def test_anthropic_messages_bomb_returns_body_too_large_status(monkeypatch
 
 @pytest.mark.asyncio
 async def test_bedrock_invoke_bomb_never_fails_open(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large
-    )
+    monkeypatch.setattr("headroom.proxy.helpers.read_request_json_with_bytes", _raise_too_large)
     handler = _BedrockHandler()
     response = await handler.handle_bedrock_invoke(
         _FakeRequest(path="/model/x/invoke"), "amazon.nova-pro-v1:0", stream=False
@@ -200,9 +189,7 @@ async def test_bedrock_invoke_bomb_never_fails_open(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_openai_batch_create_bomb_returns_body_too_large_status(monkeypatch) -> None:
     monkeypatch.setattr("headroom.proxy.helpers._read_request_json", _raise_too_large)
-    response = await _BatchHandler().handle_batch_create(
-        _FakeRequest(path="/v1/batches")
-    )
+    response = await _BatchHandler().handle_batch_create(_FakeRequest(path="/v1/batches"))
     assert response.status_code == get_body_too_large_status()
     assert _error_payload(response)["error"]["code"] == "request_too_large"
 
@@ -242,9 +229,7 @@ async def test_gemini_generate_content_bomb_returns_body_too_large_status(
 
 @pytest.mark.asyncio
 async def test_batch_passthrough_re_raises_body_too_large(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "headroom.proxy.helpers._read_request_body_bytes", _raise_too_large
-    )
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_body_bytes", _raise_too_large)
     handler = _BatchHandler()
     with pytest.raises(RequestBodyTooLarge):
         await handler._batch_passthrough(_FakeRequest(), {"model": "x"})

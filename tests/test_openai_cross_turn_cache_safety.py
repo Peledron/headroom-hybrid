@@ -105,7 +105,9 @@ def test_openai_direct_path_threads_original_messages_into_tracker() -> None:
         proxy.session_tracker_store.compute_session_id = (
             lambda request, model, messages, **_kwargs: "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: real_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: real_tracker
+        )
 
         calls = {"n": 0}
 

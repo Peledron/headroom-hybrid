@@ -7,7 +7,6 @@ from headroom.proxy.proxy_mode_policy import (
     PROXY_MODE_HYBRID,
     PROXY_MODE_TOKEN,
     normalize_proxy_mode_decision,
-    normalize_proxy_mode_value,
 )
 
 
@@ -56,6 +55,6 @@ def test_decision_uses_default_and_marks_unknown_for_invalid_mode() -> None:
     assert decision.unknown is True
 
 
-def test_value_helper_returns_only_canonical_mode() -> None:
-    assert normalize_proxy_mode_value("token_savings") == PROXY_MODE_TOKEN
-    assert normalize_proxy_mode_value("cache_mode") == PROXY_MODE_CACHE
+def test_aliases_normalize_to_canonical_mode() -> None:
+    assert normalize_proxy_mode_decision("token_savings").normalized == PROXY_MODE_TOKEN
+    assert normalize_proxy_mode_decision("cache_mode").normalized == PROXY_MODE_CACHE

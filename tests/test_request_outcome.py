@@ -307,6 +307,16 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # it here is what lets the dashboard's per-model table count the layer
         # its own headline counts. Zero for this outcome (no deferral tags).
         "tool_schema_saved": 0,
+        # Whether the positional tokens_sent is the provider's billed count.
+        # This outcome carries no provider_input_tokens, so it is an estimate.
+        "provider_reported": False,
+        # Price provenance, resolved per lookup from the handler's provider
+        # (#3732). This harness has no provider object, so the funnel passes
+        # the degrade path: no provider price, measured stamp, and the cost
+        # tracker applies its own generic fallback (labelled estimated) when
+        # LiteLLM can't price the model.
+        "price_basis": "measured",
+        "pricing": None,
     }
 
 
@@ -417,8 +427,8 @@ async def test_funnel_emits_perf_log_with_canonical_shape(
     tok_after, tok_saved, cache_read, cache_write, cache_hit_pct,
     opt_ms, transforms — in that order, space-separated."""
     h = _FunnelHarness()
-    # Direct handler attach: caplog otherwise drops propagation-disabled
-    # records (the proxy disables ``headroom.*`` propagation once started).
+    # Direct handler attach keeps capture isolated from unrelated propagation
+    # mutations elsewhere in the suite.
     target = logging.getLogger("headroom.proxy")
     captured: list[logging.LogRecord] = []
 

@@ -179,6 +179,7 @@ struct OrtApiBaseProbe {
 /// same teardown hazard that wedges process exit (ort #1715). Keeping
 /// the mapping also means the `dlopen` `ort` does next is a refcount
 /// bump on an object we already proved loadable.
+#[allow(unsafe_code)]
 fn onnxruntime_version_string(path: &Path) -> Result<String, String> {
     // SAFETY: `OrtGetApiBase` is ONNX Runtime's documented entry point.
     // It takes no arguments, cannot fail, and returns a pointer to a
@@ -190,14 +191,13 @@ fn onnxruntime_version_string(path: &Path) -> Result<String, String> {
             .map_err(|error| format!("failed to load `{}`: {error}", path.display()))?;
 
         let result = (|| {
-            let base_getter: libloading::Symbol<
-                unsafe extern "C" fn() -> *const OrtApiBaseProbe,
-            > = library.get(b"OrtGetApiBase").map_err(|error| {
-                format!(
-                    "`{}` does not export OrtGetApiBase: {error}",
-                    path.display()
-                )
-            })?;
+            let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBaseProbe> =
+                library.get(b"OrtGetApiBase").map_err(|error| {
+                    format!(
+                        "`{}` does not export OrtGetApiBase: {error}",
+                        path.display()
+                    )
+                })?;
 
             let base = base_getter();
             if base.is_null() {
@@ -919,7 +919,10 @@ index abc123..def456 100644
 
         // Recovery: the holder is gone, so the next call goes through.
         assert!(
-            !matches!(detect_for_test("hello world"), Err(MagikaDetectorError::Busy)),
+            !matches!(
+                detect_for_test("hello world"),
+                Err(MagikaDetectorError::Busy)
+            ),
             "detector stayed unusable after the holder released it"
         );
     }

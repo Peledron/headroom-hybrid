@@ -135,3 +135,62 @@ is "the agent retrieves the raw," not "the information is gone." The structural
 ledger (workstream D) provides the deterministic state, the model only writes
 the prose summary, and it runs at a bust or offline, never per-request in the
 warm path.
+
+## 2026-10-12: goal-aware forgetting and JEPA
+
+The scorer should estimate whether a block will be needed for the next few
+steps of the current task. Its inputs are the explicit goal, active constraints,
+the current plan, recent turns, and the candidate block. A block can be familiar
+and still essential. Novelty alone is insufficient for this decision.
+
+The closest verified research match is
+[FlashMemory for DeepSeek V4](https://arxiv.org/html/2606.09079v3).
+It predicts future context demand with a separately trained memory indexer and
+recalls selected KV blocks from a CPU store. Its authors include Tencent,
+university, and independent researchers. The paper reports a failure on dense
+global-memory tasks, which matters for any attempt to select only a few blocks.
+DeepSeek's own
+[sparse attention selector](https://github.com/deepseek-ai/DeepSelect/blob/main/docs/DeepSelect-deep-dive.md)
+selects attention entries inside the model. Headroom can borrow the selection
+idea, but an API proxy has access to message blocks rather than hidden states
+or provider KV caches.
+
+[I-JEPA](https://arxiv.org/abs/2301.08243) learns representations by predicting
+target embeddings from context. For this task, a JEPA representation still needs
+a goal-conditioned decision head and calibration against future use. The
+comment-lint findings in `docs/decisions/code-heads.md`, especially D-045 and
+D-057, support testing explicit intent conditioning. Those experiments concern
+code correctness and do not establish the quality of context relevance models.
+
+### Candidate and evaluation contract
+
+1. Start with the existing age, supersession, and deduplication policies. Compare
+   a goal-conditioned lexical scorer, then a frozen text encoder with a small
+   supervised relevance head. Add JEPA pretraining if it improves held-out
+   needed-block recall at the same retained token budget and acceptable latency.
+2. Give the scorer the information available at the decision time. Later
+   retrievals, re-reads, and assistant references supply labels, never features.
+   Split by complete session and project. Treat the absence of a later reference
+   as an uncertain negative until audited.
+3. Measure missed needed blocks, successful task outcomes, recovery latency,
+   billed token cost, cache writes, and scorer cost. A lower retrieval rate alone
+   can hide cases where the agent fails to notice missing evidence.
+4. Run in shadow mode first. Keep system instructions, active user constraints,
+   unresolved tool calls, signed content, and required tool definitions protected
+   by deterministic rules. The classifier supplies a score to those rules.
+5. Price each proposed rewrite through the existing cache economics gate.
+   Expected read savings must cover the cache rewrite, scoring, and expected
+   retrieval costs. Prefer an already admitted rebase or cache bust for changes
+   to a warm prefix.
+6. Store the exact original in CCR before replacing it with a reference. Confirm
+   the reference remains live before replaying a cached optimized result. Goal
+   changes should trigger rescoring and allow relevant blocks to be restored.
+
+### Current implementation boundary
+
+The novelty-routing evaluator still contains an embedding stub. No learned
+goal-aware judge or JEPA training is implemented by this upstream integration.
+Request replay capture alone also does not provide paired original histories
+and assistant responses for an outcome-quality curve. That evaluation needs a
+suitable transcript corpus or an explicitly configured capture window before
+any quality-based live pruning can graduate.

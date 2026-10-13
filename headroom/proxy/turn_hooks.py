@@ -26,6 +26,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from headroom.proxy.tool_schema_savings_policy import (
+    deferred_booking,
+    reconcile_deferred_tokens,
+    without_deferral_flags,
+)
+
 log = logging.getLogger(__name__)
 
 # Re-drive the model with a message list; returns the provider's response JSON.
@@ -198,40 +204,80 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     working on streamed OpenAI-compatible traffic. Default off ⇒ conservative:
     a hook is treated as buffered-only unless it declares itself stream-safe.
     """
+    # Deferral booked before or by a hook; reconciled once every hook has run,
+    # since a later hook may un-defer booked tools (tool search's hot tools).
+    booking = deferred_booking(ctx.tags, ctx.tools)
+    # Positive nets wait until every hook has run: a later hook that grows the
+    # request (adds a tool) offsets earlier savings, so the ledger never credits
+    # more than the whole sequence actually removed.
+    gains: list[tuple[str, int, dict[str, int]]] = []
+    sequence_net = 0
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
         fn = getattr(hook, "on_request", None)
         if fn is None:
             continue
+        booked_tag = ctx.tags.get("tool_search_deferred_tokens")
         before_messages = before_tools = None
         try:
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(ctx.tools)
+                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
+            # Signed deltas, netted: a hook that folds messages but ADDS a tool
+            # (skill search's ``search_skills``) saved the difference, not the
+            # fold alone. Booked only when the net is a saving.
             message_saved = (
-                max(0, before_messages - ctx.count_messages(ctx.messages))
+                before_messages - ctx.count_messages(ctx.messages)
                 if before_messages is not None and ctx.count_messages is not None
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(ctx.tools))
+                before_tools - ctx.count_tools(without_deferral_flags(ctx.tools))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )
-            if message_saved or tool_saved:
-                ctx.record_savings(
-                    getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
-                    tokens=message_saved + tool_saved,
-                    details={
-                        "message_tokens_saved": message_saved,
-                        "tool_tokens_saved": tool_saved,
-                    },
+            net_saved = message_saved + tool_saved
+            sequence_net += net_saved
+            if net_saved > 0:
+                gains.append(
+                    (
+                        getattr(hook, "savings_source", getattr(hook, "name", type(hook).__name__)),
+                        net_saved,
+                        {"message_tokens_saved": message_saved, "tool_tokens_saved": tool_saved},
+                    )
                 )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
+            # This hook booked (or re-booked) the deferral: it is the new baseline.
+            booking = deferred_booking(ctx.tags, ctx.tools)
+    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
+    # Book gains in run order up to the sequence's net saving; a loss that
+    # exceeds them all books nothing (never a negative entry).
+    budget = max(0, sequence_net)
+    for source, net_saved, details in gains:
+        tokens = min(net_saved, budget)
+        if tokens <= 0:
+            break
+        budget -= tokens
+        if tokens < net_saved:
+            # Later hooks' cost comes off this credit; share it across the
+            # message and tool parts so the breakdown still sums to ``tokens``.
+            # The uncapped deltas stay for diagnosis.
+            message_part = round(details["message_tokens_saved"] * tokens / net_saved)
+            details = {
+                "message_tokens_saved": message_part,
+                "tool_tokens_saved": tokens - message_part,
+                "uncapped_message_tokens_saved": details["message_tokens_saved"],
+                "uncapped_tool_tokens_saved": details["tool_tokens_saved"],
+            }
+        try:
+            ctx.record_savings(source, tokens=tokens, details=details)
+        except Exception:
+            log.exception("turn hook savings for %r not recorded", source)
 
 
 async def run_response_hooks(

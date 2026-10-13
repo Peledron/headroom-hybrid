@@ -271,12 +271,15 @@ class TestHandlerWiring:
         proxy_logger = logging.getLogger("headroom.proxy")
         proxy_logger.addHandler(caplog.handler)
         previous = proxy_logger.level
+        previous_propagate = proxy_logger.propagate
+        proxy_logger.propagate = False
         proxy_logger.setLevel(logging.INFO)
         try:
             self._post("hi")
         finally:
             proxy_logger.removeHandler(caplog.handler)
             proxy_logger.setLevel(previous)
+            proxy_logger.propagate = previous_propagate
 
         lines = [r.getMessage() for r in caplog.records if "OUTPUT_DIAG" in r.getMessage()]
         assert len(lines) == 1

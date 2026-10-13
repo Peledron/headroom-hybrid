@@ -49,6 +49,9 @@ class _FakeRequest:
     async def body(self):
         return self._raw
 
+    async def stream(self):
+        yield self._raw
+
 
 def _read(raw, encoding):
     return asyncio.run(_read_request_body_bytes(_FakeRequest(raw, {"content-encoding": encoding})))

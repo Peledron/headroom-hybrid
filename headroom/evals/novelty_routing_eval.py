@@ -196,9 +196,7 @@ def load_session(path: Path) -> SessionData:
                 continue
 
             if _is_compaction_boundary(entry):
-                events.append(
-                    TranscriptEvent(kind="compaction_boundary", index=len(events))
-                )
+                events.append(TranscriptEvent(kind="compaction_boundary", index=len(events)))
                 continue
 
             entry_type = entry.get("type")
@@ -325,7 +323,7 @@ def _rare_token_doc_freq(sessions: list[SessionData]) -> dict[str, float]:
             if event.kind != "tool_output":
                 continue
             total_outputs += 1
-            tokens = set(t.lower() for t in _WORD_RE.findall(event.text))
+            tokens = {t.lower() for t in _WORD_RE.findall(event.text)}
             doc_count.update(tokens)
     if total_outputs == 0:
         return {}
@@ -394,15 +392,17 @@ def label_session(
                     break
 
         # Rule (c): rare-token overlap with a later assistant message.
-        output_tokens = set(t.lower() for t in _WORD_RE.findall(event.text))
+        output_tokens = {t.lower() for t in _WORD_RE.findall(event.text)}
         rare_output_tokens = {
-            t for t in output_tokens if rare_token_doc_freq.get(t, 1.0) < RARE_TOKEN_DOC_FREQ_THRESHOLD
+            t
+            for t in output_tokens
+            if rare_token_doc_freq.get(t, 1.0) < RARE_TOKEN_DOC_FREQ_THRESHOLD
         }
         if rare_output_tokens:
             for later in events[i + 1 :]:
                 if later.kind != "assistant_text":
                     continue
-                later_tokens = set(t.lower() for t in _WORD_RE.findall(later.text))
+                later_tokens = {t.lower() for t in _WORD_RE.findall(later.text)}
                 if len(rare_output_tokens & later_tokens) >= RARE_TOKEN_MIN_OVERLAP:
                     rules_fired.append("rare_token_overlap")
                     break
@@ -460,9 +460,7 @@ def audit_labels(all_labels: list[LabeledEvent]) -> dict[str, Any]:
     for lbl in all_labels:
         per_session[lbl.session_id].append(lbl.needed_later)
 
-    rates = {
-        sid: (sum(flags) / len(flags) if flags else 0.0) for sid, flags in per_session.items()
-    }
+    rates = {sid: (sum(flags) / len(flags) if flags else 0.0) for sid, flags in per_session.items()}
     rate_values = list(rates.values())
     degenerate_sessions = [
         sid
@@ -840,9 +838,7 @@ def _embedding_stub_report() -> dict[str, Any]:
 
 def run_eval(corpus_root: Path, bootstrap_resamples: int = BOOTSTRAP_RESAMPLES) -> dict[str, Any]:
     sessions = walk_corpus(corpus_root)
-    total_tool_outputs = sum(
-        1 for s in sessions for e in s.events if e.kind == "tool_output"
-    )
+    total_tool_outputs = sum(1 for s in sessions for e in s.events if e.kind == "tool_output")
     smoke_test_only = (
         len(sessions) < MIN_SESSIONS_FOR_REAL_RUN
         or total_tool_outputs < MIN_TOOL_OUTPUTS_FOR_REAL_RUN

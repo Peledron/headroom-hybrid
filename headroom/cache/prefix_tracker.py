@@ -1267,6 +1267,36 @@ def _client_marker_positions(
     return positions
 
 
+def _strip_block_cache_control(block: Any) -> tuple[Any, bool]:
+    """Strip ``cache_control`` from a content block at ANY nesting depth.
+
+    ``tool_result`` blocks nest their own block list under ``content``, and the
+    provider processes markers found there (in tools → system → messages
+    order). Sub-call shapes that pack a transcript into a message re-forward
+    the inner conversation's markers this way, so a leftover nested
+    ``ttl='1h'`` marker sitting after the single re-placed 5m breakpoint 400s
+    the whole request. Recurses ONLY through ``content`` lists, because tool
+    ``input`` payloads are user data and must be forwarded verbatim even if
+    they happen to contain a literal "cache_control" key.
+
+    Returns ``(block, False)`` with the original object, unchanged, when
+    there was nothing to strip.
+    """
+    if not isinstance(block, dict):
+        return block, False
+    changed = "cache_control" in block
+    out = {k: v for k, v in block.items() if k != "cache_control"}
+    inner = out.get("content")
+    if isinstance(inner, list):
+        stripped_inner = []
+        for b in inner:
+            sb, ch = _strip_block_cache_control(b)
+            stripped_inner.append(sb)
+            changed = changed or ch
+        out["content"] = stripped_inner
+    return (out, True) if changed else (block, False)
+
+
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
     previous_forwarded_messages: list[dict[str, Any]] | None = None,
@@ -1355,15 +1385,17 @@ def normalize_message_cache_control(
         content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
             had = False
+            stripped = []
             for b in content:
-                if isinstance(b, dict) and "cache_control" in b:
-                    had = True
-                    if isinstance(b["cache_control"], dict):
-                        last_marker = b["cache_control"]
-            stripped = [
-                {k: v for k, v in b.items() if k != "cache_control"} if isinstance(b, dict) else b
-                for b in content
-            ]
+                if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                    # Only TOP-LEVEL markers express the client's current
+                    # breakpoint intent. Markers nested inside a packed
+                    # tool_result are the inner conversation's leftovers and
+                    # must only ever be stripped, never reused.
+                    last_marker = b["cache_control"]
+                sb, ch = _strip_block_cache_control(b)
+                stripped.append(sb)
+                had = had or ch
             out.append({**msg, "content": stripped} if had else msg)
             changed = changed or had
             if stripped and isinstance(stripped[-1], dict):

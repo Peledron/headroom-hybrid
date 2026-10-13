@@ -68,6 +68,82 @@ def test_force_5m_idempotent_across_turns():
         assert _sole_ttl(conv) == "5m"
 
 
+def _all_ttls(messages):
+    """Every cache_control ttl in message order, at ANY nesting depth."""
+    found = []
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            cc = obj.get("cache_control")
+            if isinstance(cc, dict):
+                found.append(cc.get("ttl", "5m"))
+            walk(obj.get("content"))
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(messages)
+    return found
+
+
+def test_nested_tool_result_marker_is_stripped():
+    # Regression: a transcript packed into a tool_result re-forwards the inner
+    # conversation's cache_control markers. The provider processes nested
+    # markers too, so a leftover ttl='1h' after the re-placed 5m breakpoint
+    # 400s: "a ttl='1h' cache_control block must not come after a ttl='5m'
+    # cache_control block".
+    packed = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "context"},
+            {"type": "text", "text": "stable tail"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "tu_1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "inner transcript",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    }
+                ],
+            },
+        ],
+    }
+    msgs = [_blk("user", "a"), _blk("assistant", "b"), packed]
+    out = normalize_message_cache_control(msgs, force_ttl="5m")
+    ttls = _all_ttls(out)
+    assert ttls == ["5m"], f"nested 1h leftover must not survive: {ttls}"
+    # semantic content untouched
+    assert _strip_cache_control(out) == _strip_cache_control(msgs)
+
+
+def test_nested_marker_never_becomes_client_intent():
+    # A nested leftover must not be promoted to the re-placed breakpoint's
+    # marker: with no force_ttl, the breakpoint stays a bare ephemeral (5m
+    # default) rather than inheriting the packed transcript's 1h.
+    packed = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "tu_1",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "inner",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    }
+                ],
+            },
+            {"type": "text", "text": "tail"},
+        ],
+    }
+    out = normalize_message_cache_control([packed])
+    ttls = _all_ttls(out)
+    assert "1h" not in ttls, f"leftover 1h reused as breakpoint: {ttls}"
+
+
 # ── sub-agent detection from the system head ──────────────────────────────────
 
 MODEL = "claude-opus-4-8"

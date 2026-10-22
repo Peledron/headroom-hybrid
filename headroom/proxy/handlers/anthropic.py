@@ -3126,6 +3126,7 @@ class AnthropicHandlerMixin:
                     # the token / non-cache / cache-delta split so every forwarded
                     # request sees the same discovery and admission decision.
                     _hoisted_mask_result = None
+                    _hoisted_mask_rebased = False
                     _mask_candidates = []
                     _masking_admitted = False
                     _masking_config = prefix_tracker.hybrid_controller.config
@@ -3136,8 +3137,8 @@ class AnthropicHandlerMixin:
                             apply_candidates,
                             closed_episode_turn,
                             discover_candidates,
-                            keep_cached_prefix,
                             masking_gate_gain,
+                            split_replayed_masks,
                         )
 
                         # A direct upstream SSE tool input cannot be recalled once
@@ -3189,8 +3190,9 @@ class AnthropicHandlerMixin:
                             or _hybrid_should_rebase
                             or _hybrid_alive <= 0.05
                         )
+                        _mask_replayed: list = []
                         if not _mask_prefix_dead:
-                            _mask_candidates = keep_cached_prefix(
+                            _mask_replayed, _mask_candidates = split_replayed_masks(
                                 _mask_candidates,
                                 previous_forwarded=previous_forwarded_messages,
                                 frozen_count=frozen_message_count,
@@ -3319,9 +3321,10 @@ class AnthropicHandlerMixin:
 
                             _hoisted_mask_result = apply_candidates(
                                 messages,
-                                _mask_candidates,
+                                _mask_replayed + _mask_candidates,
                                 compression_store=get_compression_store(),
                             )
+                            _hoisted_mask_rebased = bool(_hoisted_mask_result.masked_count)
                             messages = _hoisted_mask_result.messages
                             if getattr(_masking_config, "history_sweep", True):
                                 from headroom.transforms.compression_units import (
@@ -3360,6 +3363,20 @@ class AnthropicHandlerMixin:
                                             ),
                                             swept_count=_sweep_result.swept_count,
                                         )
+                            optimized_messages = messages
+                            optimized_tokens = _count_msgs(messages)
+                        elif _mask_replayed:
+                            from headroom.cache.compression_store import (
+                                get_compression_store,
+                            )
+
+                            # Dropping a mask the cached prefix already carries busts it.
+                            _hoisted_mask_result = apply_candidates(
+                                messages,
+                                _mask_replayed,
+                                compression_store=get_compression_store(),
+                            )
+                            messages = _hoisted_mask_result.messages
                             optimized_messages = messages
                             optimized_tokens = _count_msgs(messages)
 
@@ -3972,7 +3989,7 @@ class AnthropicHandlerMixin:
                                 previous_original_messages,
                                 previous_forwarded_messages,
                             )
-                        if _hoisted_mask_result is not None and _hoisted_mask_result.masked_count:
+                        if _hoisted_mask_rebased:
                             # An admitted historical mutation intentionally rebases
                             # the prefix, so replaying the previous forwarded prefix
                             # would silently restore the unmasked bytes.

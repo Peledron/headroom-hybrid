@@ -8,8 +8,8 @@ from headroom.transforms.observation_masking import (
     _MASKABLE_INPUT_KEYS,
     apply_candidates,
     discover_candidates,
-    keep_cached_prefix,
     masking_gate_gain,
+    split_replayed_masks,
 )
 
 
@@ -292,29 +292,34 @@ def test_mask_replay_ledger_books_each_masked_block_once():
     assert ledger.replayed_token_debt(original, original, _count) == 0
 
 
-def test_keep_cached_prefix_drops_new_masks_inside_frozen_prefix():
+def test_split_replayed_masks_drops_new_masks_inside_frozen_prefix():
     messages = _messages("word " * 30)
     candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
     assert len(candidates) == 1
 
-    kept = keep_cached_prefix(candidates, previous_forwarded=messages, frozen_count=2)
-    assert kept == []
+    assert split_replayed_masks(
+        candidates, previous_forwarded=messages, frozen_count=2
+    ) == ([], [])
 
 
-def test_keep_cached_prefix_replays_mask_already_forwarded():
+def test_split_replayed_masks_replays_mask_already_forwarded():
     messages = _messages("word " * 30)
     candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
     forwarded = apply_candidates(
         deepcopy(messages), candidates, compression_store=_Store()
     ).messages
 
-    kept = keep_cached_prefix(candidates, previous_forwarded=forwarded, frozen_count=2)
-    assert kept == candidates
+    for frozen_count in (0, 2):
+        assert split_replayed_masks(
+            candidates, previous_forwarded=forwarded, frozen_count=frozen_count
+        ) == (candidates, [])
 
 
-def test_keep_cached_prefix_passes_slots_past_frozen_boundary():
+def test_split_replayed_masks_prices_slots_past_frozen_boundary():
     messages = _messages("word " * 30)
     candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
 
-    assert keep_cached_prefix(candidates, previous_forwarded=None, frozen_count=1) == candidates
-    assert keep_cached_prefix(candidates, previous_forwarded=None, frozen_count=0) == candidates
+    for frozen_count in (0, 1):
+        assert split_replayed_masks(
+            candidates, previous_forwarded=None, frozen_count=frozen_count
+        ) == ([], candidates)

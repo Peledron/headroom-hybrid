@@ -113,6 +113,7 @@ async def _run_request(
     gain: float,
     frozen_count: int = 0,
     mode: str = "balanced",
+    previous_forwarded: list[dict] | None = None,
 ):  # noqa: ANN001, ANN202
     captured: dict = {}
     store = _Store()
@@ -129,6 +130,8 @@ async def _run_request(
         tracker = _HybridMaskingTracker(
             client_prefix_alive=alive, frozen_count=frozen_count
         )
+        if previous_forwarded is not None:
+            tracker._last_forwarded_messages = deepcopy(previous_forwarded)
         # The fake tracker has no prior turn to confirm against.
         proxy._strict_previous_turn_frozen_count = lambda messages, count: count
         proxy.session_tracker_store.compute_session_id = (
@@ -237,3 +240,24 @@ async def test_admitted_masking_leaves_frozen_prefix_bytes_unchanged(
 
     assert _without_cache_control(forwarded) == original
     assert store.calls == []
+
+
+async def test_declined_gate_still_replays_masks_the_cached_prefix_carries(
+    monkeypatch,
+) -> None:
+    masked_turn, _, _ = await _run_request(
+        monkeypatch, alive=1.0, gain=1.0, mode="hybrid"
+    )
+    masked_turn = _without_cache_control(masked_turn)
+
+    forwarded, original, _ = await _run_request(
+        monkeypatch,
+        alive=1.0,
+        gain=-1.0,
+        frozen_count=3,
+        mode="hybrid",
+        previous_forwarded=masked_turn,
+    )
+
+    assert _without_cache_control(forwarded) != original
+    assert _without_cache_control(forwarded)[:3] == masked_turn[:3]

@@ -700,29 +700,29 @@ def _masked_values(messages: list[dict[str, Any]]) -> dict[tuple[str, str], str]
     return values
 
 
-def keep_cached_prefix(
+def split_replayed_masks(
     candidates: list[MaskCandidate],
     *,
     previous_forwarded: list[dict[str, Any]] | None,
     frozen_count: int,
-) -> list[MaskCandidate]:
-    """Drop candidates that would change bytes the provider already cached.
+) -> tuple[list[MaskCandidate], list[MaskCandidate]]:
+    """Split candidates into ``(replayed, fresh)`` against the cached prefix.
 
-    A slot inside the first ``frozen_count`` messages may be masked only when
-    the previous request already forwarded that exact marker, which re-sends
-    identical bytes. Any other mask there moves the prefix and forces a full
-    cache rewrite to save a few hundred tokens. Slots past the frozen boundary
-    are uncached and pass through for the gate to price.
+    A replayed candidate's exact marker went out on the previous request, so
+    applying it re-sends cached bytes and costs nothing. A fresh candidate is
+    a new mask past the first ``frozen_count`` messages, for the gate to price.
+    New masks inside the frozen prefix are dropped: they move cached bytes and
+    force a full rewrite to save a few hundred tokens.
     """
-    if frozen_count <= 0:
-        return candidates
     sent = _masked_values(previous_forwarded or [])
-    return [
-        candidate
-        for candidate in candidates
-        if candidate.message_index >= frozen_count
-        or sent.get((candidate.tool_use_id, candidate.input_key or "")) == candidate.marker
-    ]
+    replayed: list[MaskCandidate] = []
+    fresh: list[MaskCandidate] = []
+    for candidate in candidates:
+        if sent.get((candidate.tool_use_id, candidate.input_key or "")) == candidate.marker:
+            replayed.append(candidate)
+        elif candidate.message_index >= frozen_count:
+            fresh.append(candidate)
+    return replayed, fresh
 
 
 class MaskReplayLedger:

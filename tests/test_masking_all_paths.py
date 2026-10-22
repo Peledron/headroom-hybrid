@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import importlib.util
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
+from headroom.proxy.hybrid_mode import HybridModeConfig, HybridModeDecision, HybridPhase
 
 _STABILITY_SPEC = importlib.util.spec_from_file_location(
     "_masking_stability_helpers",
@@ -23,8 +25,8 @@ _make_proxy_client = _STABILITY._make_proxy_client
 
 
 class _HybridMaskingTracker(_FakePrefixTracker):
-    def __init__(self, *, client_prefix_alive: float) -> None:
-        super().__init__(frozen_count=0)
+    def __init__(self, *, client_prefix_alive: float, frozen_count: int = 0) -> None:
+        super().__init__(frozen_count=frozen_count)
         self._client_prefix_alive = client_prefix_alive
 
     def observe_client_churn(self, messages, head_fingerprint=None):  # noqa: ANN001, ANN201
@@ -33,13 +35,18 @@ class _HybridMaskingTracker(_FakePrefixTracker):
     @property
     def hybrid_controller(self):  # noqa: ANN201
         return SimpleNamespace(
-            config=SimpleNamespace(
+            config=replace(
+                HybridModeConfig(),
                 adaptive_ttl=False,
                 subagent_ttl_5m=False,
                 observation_masking=True,
                 mask_after_turns=0,
                 mask_min_tokens=1,
-            )
+            ),
+            decide=lambda **_: HybridModeDecision(
+                phase=HybridPhase.LIVE_DELTA,
+                frozen_message_count=self._frozen_count,
+            ),
         )
 
 
@@ -47,7 +54,7 @@ class _Policy:
     def __init__(self, gain: float) -> None:
         self.gain = gain
 
-    def net_mutation_gain(self, *args):  # noqa: ANN002, ANN201
+    def net_mutation_gain(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
         return self.gain
 
 
@@ -100,7 +107,12 @@ def _without_cache_control(messages: list[dict]) -> list[dict]:
 
 
 async def _run_request(
-    monkeypatch, *, alive: float, gain: float
+    monkeypatch,
+    *,
+    alive: float,
+    gain: float,
+    frozen_count: int = 0,
+    mode: str = "balanced",
 ):  # noqa: ANN001, ANN202
     captured: dict = {}
     store = _Store()
@@ -111,14 +123,18 @@ async def _run_request(
     proxy = app.state.proxy
     try:
         proxy.config.optimize = True
-        proxy.config.mode = "balanced"
+        proxy.config.mode = mode
         proxy.config.image_optimize = False
         proxy.config.ccr_inject_tool = True
-        tracker = _HybridMaskingTracker(client_prefix_alive=alive)
+        tracker = _HybridMaskingTracker(
+            client_prefix_alive=alive, frozen_count=frozen_count
+        )
+        # The fake tracker has no prior turn to confirm against.
+        proxy._strict_previous_turn_frozen_count = lambda messages, count: count
         proxy.session_tracker_store.compute_session_id = (
             lambda request, model, messages, system=None: f"mask-all-paths-{alive}"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider, *_: tracker
         proxy.anthropic_pipeline.apply = lambda **kwargs: SimpleNamespace(
             messages=kwargs["messages"],
             transforms_applied=[],
@@ -208,5 +224,16 @@ async def test_ccr_tool_already_injected_path_is_byte_identical_when_declined(
 
     # Cache-control placement is a separate forwarding normalization. Masking
     # itself must leave every message byte unchanged when its gate declines.
+    assert _without_cache_control(forwarded) == original
+    assert store.calls == []
+
+
+async def test_admitted_masking_leaves_frozen_prefix_bytes_unchanged(
+    monkeypatch,
+) -> None:
+    forwarded, original, store = await _run_request(
+        monkeypatch, alive=1.0, gain=1.0, frozen_count=3, mode="hybrid"
+    )
+
     assert _without_cache_control(forwarded) == original
     assert store.calls == []

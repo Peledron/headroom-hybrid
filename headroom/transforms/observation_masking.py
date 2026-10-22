@@ -700,6 +700,31 @@ def _masked_values(messages: list[dict[str, Any]]) -> dict[tuple[str, str], str]
     return values
 
 
+def keep_cached_prefix(
+    candidates: list[MaskCandidate],
+    *,
+    previous_forwarded: list[dict[str, Any]] | None,
+    frozen_count: int,
+) -> list[MaskCandidate]:
+    """Drop candidates that would change bytes the provider already cached.
+
+    A slot inside the first ``frozen_count`` messages may be masked only when
+    the previous request already forwarded that exact marker, which re-sends
+    identical bytes. Any other mask there moves the prefix and forces a full
+    cache rewrite to save a few hundred tokens. Slots past the frozen boundary
+    are uncached and pass through for the gate to price.
+    """
+    if frozen_count <= 0:
+        return candidates
+    sent = _masked_values(previous_forwarded or [])
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.message_index >= frozen_count
+        or sent.get((candidate.tool_use_id, candidate.input_key or "")) == candidate.marker
+    ]
+
+
 class MaskReplayLedger:
     """Books each masked block once per session.
 

@@ -3136,6 +3136,7 @@ class AnthropicHandlerMixin:
                             apply_candidates,
                             closed_episode_turn,
                             discover_candidates,
+                            keep_cached_prefix,
                             masking_gate_gain,
                         )
 
@@ -3183,6 +3184,17 @@ class AnthropicHandlerMixin:
                             episode_closed_turn=_closed_turn,
                             skip_result_tools=_masking_skip_tools,
                         )
+                        _mask_prefix_dead = (
+                            client_prefix_alive_fraction == 0.0
+                            or _hybrid_should_rebase
+                            or _hybrid_alive <= 0.05
+                        )
+                        if not _mask_prefix_dead:
+                            _mask_candidates = keep_cached_prefix(
+                                _mask_candidates,
+                                previous_forwarded=previous_forwarded_messages,
+                                frozen_count=frozen_message_count,
+                            )
                         if not _mask_candidates:
                             _tr_shapes: dict[str, int] = {}
                             for _m in messages:
@@ -3217,10 +3229,8 @@ class AnthropicHandlerMixin:
                                     f"shapes={_tr_shapes}"
                                 )
 
-                        _masking_structural_admission = bool(_mask_candidates) and (
-                            client_prefix_alive_fraction == 0.0
-                            or _hybrid_should_rebase
-                            or _hybrid_alive <= 0.05
+                        _masking_structural_admission = (
+                            bool(_mask_candidates) and _mask_prefix_dead
                         )
                         _masking_admitted = _masking_structural_admission
                         if _mask_candidates and not _masking_admitted and context_limit:

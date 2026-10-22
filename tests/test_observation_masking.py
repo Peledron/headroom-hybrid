@@ -8,6 +8,7 @@ from headroom.transforms.observation_masking import (
     _MASKABLE_INPUT_KEYS,
     apply_candidates,
     discover_candidates,
+    keep_cached_prefix,
     masking_gate_gain,
 )
 
@@ -289,3 +290,31 @@ def test_mask_replay_ledger_books_each_masked_block_once():
     assert ledger.replayed_token_debt(original, masked, _count) == expected
     # A turn that forwards the block unmasked owes nothing.
     assert ledger.replayed_token_debt(original, original, _count) == 0
+
+
+def test_keep_cached_prefix_drops_new_masks_inside_frozen_prefix():
+    messages = _messages("word " * 30)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    assert len(candidates) == 1
+
+    kept = keep_cached_prefix(candidates, previous_forwarded=messages, frozen_count=2)
+    assert kept == []
+
+
+def test_keep_cached_prefix_replays_mask_already_forwarded():
+    messages = _messages("word " * 30)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+    forwarded = apply_candidates(
+        deepcopy(messages), candidates, compression_store=_Store()
+    ).messages
+
+    kept = keep_cached_prefix(candidates, previous_forwarded=forwarded, frozen_count=2)
+    assert kept == candidates
+
+
+def test_keep_cached_prefix_passes_slots_past_frozen_boundary():
+    messages = _messages("word " * 30)
+    candidates = discover_candidates(messages, count_tokens=_count, mask_min_tokens=10)
+
+    assert keep_cached_prefix(candidates, previous_forwarded=None, frozen_count=1) == candidates
+    assert keep_cached_prefix(candidates, previous_forwarded=None, frozen_count=0) == candidates
